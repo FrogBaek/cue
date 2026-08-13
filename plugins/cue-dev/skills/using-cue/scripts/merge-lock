@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+# Who owns the main checkout for the length of a merge.
+#
+# Everything else in cue-dev happens on one item's branch inside one item's
+# worktree, so N items run side by side without ever meeting. The local merge is
+# the single exception: it leaves the worktree, takes over the main checkout,
+# checks out the landing branch, merges and runs the tests there. That sequence is
+# repository scope, and it is several commands long.
+#
+# `scripts/branch-holder` was written for this and does not cover it. It asks
+# whether *another worktree* holds the landing branch — and in the ordinary layout
+# it does not, because the landing branch lives in the main checkout, which is
+# exactly where every merging session goes. Two sessions both get "checked out
+# here" and both proceed, into the same working tree and the same index. git
+# serializes each command; nothing serializes the sequence, so one session's merge
+# lands in the middle of the other's test run.
+#
+# So the mutual exclusion has to be named rather than inferred. A lock directory
+# is the primitive because `mkdir` either creates or fails, atomically, on every
+# filesystem this runs on — including the ones where a check-then-write loses the
+# race it was written to win.
+#
+# It is deliberately not stolen automatically. A merge whose tests take forty
+# minutes is indistinguishable from a session that died, and picking wrong means
+# two merges in one checkout — the failure this exists to prevent. Past the stale
+# threshold it says so and names `--break`, and a human decides. That is the same
+# rule the fix loop's breaker follows: bounded, then a person.
+#
+# Usage:
+#   merge-lock --acquire <KEY>   take it, or report who has it
+#   merge-lock --release <KEY>   give it back (only if this KEY holds it)
+#   merge-lock --status          who holds it, if anyone
+#   merge-lock --break           remove a lock this KEY does not own
+#
+#   exit 0  acquired (or already ours) / released / answered / broken
+#   exit 1  held by another item / release refused — not ours
+#   exit 2  usage error / not a repository
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=plugins/cue-dev/skills/using-cue/scripts/common
+. "$SCRIPT_DIR/common"
+
+cue_repo_root >/dev/null || exit 2
+
+# A merge that is still running after this long is either a very slow test suite
+# or a session that is gone. The script does not guess which; it says how long and
+# lets a person rule.
+STALE_AFTER=1800
+
+usage() {
+  echo "usage: merge-lock --acquire <KEY> | --release <KEY> | --status | --break" >&2
+  exit 2
+}
+
+lock_dir() {
+  local common
+  common=$(git rev-parse --git-common-dir 2>/dev/null) || { echo "not a git repository" >&2; exit 2; }
+  common=$(cd "$common" && pwd -P)
+  printf '%s/cue-dev-merge.lock\n' "$common"
+}
+
+LOCK=$(lock_dir)
+HOLDER="$LOCK/holder"
+
+# Reads the holder file into HELD_KEY / HELD_WORKTREE / HELD_SINCE.
+#
+# A lock directory with no readable holder file is a half-written one — the mkdir
+# won and the write did not. Treated as held by an unknown owner rather than as
+# free: the alternative is deciding a race in favour of whoever arrived second.
+read_holder() {
+  HELD_KEY="(unknown)"
+  HELD_WORKTREE="(unknown)"
+  HELD_SINCE=""
+  [ -f "$HOLDER" ] || return 0
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      key=*)      HELD_KEY=${line#key=} ;;
+      worktree=*) HELD_WORKTREE=${line#worktree=} ;;
+      since=*)    HELD_SINCE=${line#since=} ;;
+    esac
+  done < "$HOLDER"
+}
+
+age_line() {
+  local now age
+  [ -n "$HELD_SINCE" ] || { printf '  %-10s%s\n' held "for an unknown time — the holder file has no timestamp"; return; }
+  now=$(date +%s)
+  age=$((now - HELD_SINCE))
+  [ "$age" -ge 0 ] || age=0
+  if [ "$age" -lt 60 ]; then
+    printf '  %-10s%s\n' held "${age}s"
+  else
+    printf '  %-10s%s\n' held "$((age / 60))m"
+  fi
+  if [ "$age" -gt "$STALE_AFTER" ]; then
+    printf '  %-10s%s\n' stale "older than $((STALE_AFTER / 60))m — the session may be gone"
+    printf '  %-10s%s\n' 'what now' "ask your human partner, then: merge-lock --break"
+  fi
+}
+
+report_held() {
+  printf '  %-10s%s\n' lock "held by another item"
+  printf '  %-10s%s\n' item "$HELD_KEY"
+  printf '  %-10s%s\n' workspace "$HELD_WORKTREE"
+  age_line
+}
+
+case "${1:-}" in
+  --acquire)
+    [ $# -eq 2 ] || usage
+    key=$2
+    cue_key_is_safe "$key" || { echo "not usable as a KEY: $key" >&2; exit 2; }
+
+    if mkdir "$LOCK" 2>/dev/null; then
+      here=$(cue_repo_root)
+      {
+        printf 'key=%s\n' "$key"
+        printf 'worktree=%s\n' "$here"
+        printf 'since=%s\n' "$(date +%s)"
+      } > "$HOLDER"
+      printf '  %-10s%s\n' lock "acquired by $key"
+      exit 0
+    fi
+
+    read_holder
+    # Re-entrant on purpose. finish stamps no marker and is repeatable, so a
+    # merge whose tests failed is expected to be run again from the same item —
+    # and a second attempt must not deadlock against its own first one.
+    if [ "$HELD_KEY" = "$key" ]; then
+      printf '  %-10s%s\n' lock "already held by $key — continuing"
+      exit 0
+    fi
+    report_held
+    exit 1
+    ;;
+
+  --release)
+    [ $# -eq 2 ] || usage
+    key=$2
+    cue_key_is_safe "$key" || { echo "not usable as a KEY: $key" >&2; exit 2; }
+
+    if [ ! -d "$LOCK" ]; then
+      printf '  %-10s%s\n' lock "already free"
+      exit 0
+    fi
+    read_holder
+    if [ "$HELD_KEY" != "$key" ]; then
+      printf '  %-10s%s\n' lock "not yours to release"
+      printf '  %-10s%s\n' item "$HELD_KEY"
+      printf '  %-10s%s\n' 'what now' "leave it — that session is still inside its merge"
+      exit 1
+    fi
+    rm -rf "$LOCK"
+    printf '  %-10s%s\n' lock "released by $key"
+    exit 0
+    ;;
+
+  --status)
+    [ $# -eq 1 ] || usage
+    if [ ! -d "$LOCK" ]; then
+      printf '  %-10s%s\n' lock free
+      exit 0
+    fi
+    read_holder
+    printf '  %-10s%s\n' lock held
+    printf '  %-10s%s\n' item "$HELD_KEY"
+    printf '  %-10s%s\n' workspace "$HELD_WORKTREE"
+    age_line
+    exit 0
+    ;;
+
+  --break)
+    [ $# -eq 1 ] || usage
+    if [ ! -d "$LOCK" ]; then
+      printf '  %-10s%s\n' lock "already free — nothing to break"
+      exit 0
+    fi
+    read_holder
+    rm -rf "$LOCK"
+    printf '  %-10s%s\n' lock "broken — was held by $HELD_KEY"
+    printf '  %-10s%s\n' workspace "$HELD_WORKTREE"
+    exit 0
+    ;;
+
+  *) usage ;;
+esac

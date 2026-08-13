@@ -1,0 +1,299 @@
+#!/usr/bin/env bash
+# Rewinds to a given stage. Every artifact after that stage becomes invalid.
+#
+# Because rewinding is destructive, the order is fixed — find the marker, show the
+# user what will disappear and get consent, create a backup branch, and only then
+# reset. The backup branch is what leaves a recovery path if the rewind was wrong.
+#
+# If pushed commits are in the range, it only warns. Force-pushing is the user's
+# call.
+#
+# Usage: scripts/redo <demand|design|plan|implement> [KEY] [--dry-run|--yes]
+#
+# --dry-run shows what would be discarded, changes nothing, and exits 0. The
+# preview used to be "run it with no stdin and let the prompt hit EOF", which
+# exited 1 — a report that reports itself as a failure. Claude previews with
+# --dry-run, asks the user in the conversation, and runs --yes with the answer in
+# hand.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=plugins/cue-dev/skills/using-cue/scripts/common
+. "$SCRIPT_DIR/common"
+
+# Marker lookups sweep the history several times. Read it once in the main shell.
+cue_log_load
+
+usage() {
+  echo "usage: scripts/redo <demand|design|plan|implement> [KEY] [--dry-run|--yes]" >&2
+  exit 2
+}
+
+[ $# -ge 1 ] || usage
+stage=$1; shift
+
+assume_yes=0
+dry_run=0
+key=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --yes) assume_yes=1 ;;
+    --dry-run) dry_run=1 ;;
+    -*) usage ;;
+    *) [ -z "$key" ] || usage; key=$1 ;;
+  esac
+  shift
+done
+
+case "$stage" in
+  demand|design|plan|implement) ;;
+  *) usage ;;
+esac
+
+if [ -z "$key" ]; then
+  key=$(cue_key_from_branch) || {
+    echo "no KEY found from the current branch. Pass one: scripts/redo $stage <KEY>" >&2
+    exit 2
+  }
+fi
+cue_key_is_safe "$key" || { echo "not usable as a KEY: $key" >&2; exit 2; }
+
+work=$(cue_work_dir "$key")
+
+# implement goes to *right after* the plan marker. That keeps the plan and redoes
+# only the implementation.
+if [ "$stage" = implement ]; then
+  marker_stage=plan
+else
+  marker_stage=$stage
+fi
+
+# --- Whose history is about to be reset --------------------------------------
+#
+# Nothing here ever asked. `git reset --hard` was run on whatever HEAD happened to
+# be, on the strength of a marker lookup that only proves the commit exists in
+# *this* history — and after a merge it exists in the base branch's history too.
+#
+# So on a landed item, run from the base branch, this script resolved the plan
+# marker, found it, and reset the base branch onto it. In a real repository that
+# was `main` and seventeen commits, the merge among them. And it was not reached
+# by accident: `scripts/status` printed `rewind /cue-dev:redo implement (rewinds
+# the branch — what landed stays landed)` on exactly that item, which is an offer
+# to do the one thing this would not have done.
+#
+# Two questions, in this order, because the first has the more useful answer.
+head_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
+item_branch=$(cue_item_branch "$key" 2>/dev/null || true)
+
+rewind_blocked=""
+if cue_item_landed "$key" 2>/dev/null; then
+  rewind_blocked=landed
+elif [ -n "$item_branch" ] && [ "$item_branch" != "$head_branch" ]; then
+  rewind_blocked=elsewhere
+fi
+
+if [ -n "$rewind_blocked" ]; then
+  cue_head "REWIND blocked · $stage"
+  echo
+  printf '  %-10s%s\n' key "$key"
+  case "$rewind_blocked" in
+    landed)
+      base=$(cue_item_base_ref "$key" 2>/dev/null || echo 'its start point')
+      printf '  %-10sthis work has landed in %s — the commits are part of that branch now\n' \
+        blocked "$base"
+      # The number is the point. "It would reset the wrong branch" is an
+      # abstraction; "38 commits" is the thing that would have gone.
+      if marker_sha=$(cue_marker_commit "$marker_stage" "$key" 2>/dev/null); then
+        [ "$stage" = implement ] || marker_sha="$marker_sha^"
+        if git rev-parse --verify --quiet "$marker_sha^{commit}" >/dev/null 2>&1; then
+          printf '  %-10sresetting here would discard %s commits from %s\n' \
+            would "$(git rev-list --count "$marker_sha..HEAD")" "$head_branch"
+        fi
+      fi
+      printf '  %-10s/cue-dev:start  — a change to landed work is new work\n' now
+      printf '  %-10s/cue-dev:status %s\n' now "$key"
+      ;;
+    elsewhere)
+      printf "  %-10sthis item's work is on %s; HEAD is %s\n" blocked "$item_branch" "$head_branch"
+      printf '  %-10snothing was changed\n' note
+      if git rev-parse --verify --quiet "refs/heads/$item_branch" >/dev/null 2>&1; then
+        printf '  %-10sgit switch %s  — then run this again\n' now "$item_branch"
+      else
+        printf '  %-10sthe branch %s does not exist here — it was deleted, or this is another clone\n' \
+          now "$item_branch"
+      fi
+      printf '  %-10s/cue-dev:status %s\n' now "$key"
+      ;;
+  esac
+  cue_rule
+  exit 1
+fi
+
+# Rewinding is as linear as going forward: a stage can only be redone once it has
+# been done. What that refusal must not be is a dead end.
+#
+# It was one. Asking to rewind to a stage that had never run printed "that stage
+# has not run yet" and exited — accurate, and with nothing to act on, which is the
+# same shape as the refusal that made scripts/gate necessary in the first place.
+# Going forward, a stage that cannot run names the one that can; going back had no
+# such answer, so the ordering was only half enforced by anything the controller
+# could read.
+marker=$(cue_marker_commit "$marker_stage" "$key") || {
+  cue_head "REWIND blocked · $stage"
+  echo
+  printf '  %-10s%s\n' key "$key"
+  printf '  %-10s%s has not run for this work (no %s)\n' \
+    blocked "$stage" "$(cue_marker "$marker_stage" "$key")"
+  printf '  %-10s%s\n' stamped "$(cue_latest_stage "$key" 2>/dev/null || echo 'nothing')"
+  echo
+  # Only the stages that actually have a marker. `implement` rides on the plan
+  # marker, which is why it is listed with plan rather than on its own.
+  available=0
+  for s in demand design plan; do
+    if cue_marker_commit "$s" "$key" >/dev/null 2>&1; then
+      printf '  %-10s/cue-dev:redo %s\n' now "$s"
+      available=1
+      [ "$s" = plan ] && printf '  %-10s/cue-dev:redo implement\n' now
+    fi
+  done
+  [ "$available" -eq 0 ] && printf '  %-10s/cue-dev:start  — nothing has been stamped to rewind\n' now
+  printf '  %-10s/cue-dev:status %s\n' now "$key"
+  cue_rule
+  exit 1
+}
+
+if [ "$stage" = implement ]; then
+  target=$marker            # the plan commit is kept
+  discard_from=$marker
+else
+  target="$marker^"         # the stage's own commit is discarded
+  discard_from=$marker
+fi
+# If the marker is the repository's initial commit, it has no parent. This actually
+# happens: starting with /cue-dev:start in an empty repository makes
+# cue-dev(demand) the initial commit. The rewind point is then the "zero commits"
+# state, so instead of a reset we detach HEAD (the backup branch holds the commits).
+root_reset=0
+if ! git rev-parse --verify --quiet "$target^{commit}" >/dev/null; then
+  if [ "$stage" != implement ] && [ -z "$(git rev-list --parents -n 1 "$marker" | cut -s -d' ' -f2-)" ]; then
+    root_reset=1
+  else
+    echo "no rewind point found: $target" >&2
+    exit 1
+  fi
+fi
+
+case "$stage" in
+  demand)    lost="design.md · plan.md · outcome.md · every implementation commit" ;;
+  design)    lost="design.md · plan.md · outcome.md · implementation commits" ;;
+  plan)      lost="plan.md · outcome.md · implementation commits" ;;
+  implement) lost="implementation commits · recorded rows in outcome.md (plan.md is kept)" ;;
+esac
+
+if [ "$root_reset" -eq 1 ]; then
+  discarded=$(git rev-list --count HEAD)
+  where="back to the repository's initial state"
+else
+  discarded=$(git rev-list --count "$target..HEAD")
+  where="after $(git rev-parse --short "$target")"
+fi
+# Same frame and same label column as scripts/status. Both are read by the user
+# directly — status to decide where to go next, this to consent to a destructive
+# reset — so they should look like one tool rather than two.
+#
+# Keeping every line as `label + value` is also what keeps this script out of the
+# localization question: what is left after the labels is file names, SHAs, branch
+# names and commands, none of which translate. A sentence would have to.
+#
+# The KEY is a body line, not part of the title — a long one used to widen the
+# whole frame to carry a value the `key` line carries anyway.
+cue_head "REWIND preview · $stage"
+echo
+printf '  %-10s%s\n' key "$key"
+printf '  %-10s%s commits · %s\n' discard "$discarded" "$where"
+printf '  %-10s%s\n' lose "$lost"
+if cue_has_pushed_commits "$discard_from"; then
+  printf '  %-10s⚠ already pushed — force-push is your call\n' remote
+fi
+echo
+
+if [ "$dry_run" -eq 1 ]; then
+  printf '  %-10sask the user, then re-run with --yes\n' consent
+  printf '  %-10snothing was changed\n' preview
+  # Closed, because this is where the output ends — an unclosed frame is a box the
+  # user is told to reproduce verbatim and which reads as truncated. The
+  # interactive path below leaves it open on purpose: the prompt and then the DONE
+  # box follow.
+  cue_rule
+  exit 0
+fi
+
+if [ "$assume_yes" -ne 1 ]; then
+  printf '  %-10stype yes to proceed: ' confirm
+  # Interactive use still works: a human at a terminal types yes. Claude does not
+  # reach this prompt — it previews with --dry-run, asks in the conversation, and
+  # runs --yes with the answer in hand. With no stdin attached this is EOF, and
+  # EOF is not consent.
+  if ! read -r answer; then
+    echo
+    printf '  %-10sno input attached — ask the user, then re-run with --yes\n' confirm
+    exit 1
+  fi
+  # The prompt deliberately ends without a newline so the answer sits on the same
+  # line. Interactively the user's Enter closes it and this adds the blank line
+  # before the result; piped, this is what closes it at all.
+  echo
+  [ "$answer" = "yes" ] || { printf '  %-10snothing was changed\n' cancelled; exit 1; }
+fi
+
+backup=$(cue_backup_branch "$key")
+if [ "$root_reset" -eq 1 ]; then
+  # Back to having no commits. The backup branch was created first, so the commits
+  # are still alive.
+  git update-ref -d HEAD
+  git reset --hard >/dev/null
+else
+  git reset --hard "$target" >/dev/null
+fi
+cue_log_invalidate   # the history changed — drop the cached commit subjects
+
+# reset has already reverted the tracked files. Only artifacts left uncommitted
+# need cleaning up. (For implement, outcome.md is restored to its state at the plan
+# commit — the skeleton.)
+if [ -d "$work" ]; then
+  git clean -fdq -- "$work"
+fi
+
+cue_head "REWIND done · $stage"
+echo
+printf '  %-10s%s\n' key "$key"
+printf '  %-10s%s\n' backup "$backup"
+# What to do with that name. It was printed for years with nothing saying how to
+# use it, while cue-dev:redo called it "the only recovery path" three times — so
+# the recovery that did happen was a `git log` read by eye and a hand-rolled
+# `git reset --hard`, which is the move this plugin exists to remove.
+printf '  %-10s%s\n' 'undo this' "scripts/restore $key  — lists this and any earlier ones"
+
+# Earlier backups for the same KEY. Repeated rewinds keep piling them up and nobody
+# deletes them on their own. The one just created is the recovery path from here on,
+# so it is excluded from the list — what is up for cleanup is the residue of
+# previous rewinds.
+prev=$(git for-each-ref --format='%(refname:short)' "refs/heads/$(cue_backup_prefix)${key}-*" \
+  | grep -vFx "$backup" || true)
+if [ -n "$prev" ]; then
+  printf '  %-10s%s from earlier rewinds\n' older "$(printf '%s\n' "$prev" | grep -c .)"
+  while IFS= read -r b; do
+    printf '  %-10s%s  (%s)\n' '' "$b" "$(git log -1 --format=%cr "$b")"
+  done <<< "$prev"
+  printf '  %-10sgit branch -D %s\n' delete "$(printf '%s\n' "$prev" | paste -sd' ' -)"
+fi
+
+# Rewinding to demand means starting from the requirement again. There is no
+# /cue-dev:demand command.
+echo
+if [ "$stage" = demand ]; then
+  printf '  %-10s/cue-dev:start\n' next
+else
+  printf '  %-10s/cue-dev:%s\n' next "$stage"
+fi
+cue_rule

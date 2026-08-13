@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# Creates the work directory .cue/dev/<KEY>/. Refuses if it already exists.
+#
+# The KEY is the identifier the developer knows. cue-dev does not validate its
+# format, only its filesystem safety — a ticket key, a date slug, or an in-house
+# convention all pass through unchanged.
+#
+# Preventing overwrites is why this script exists. Starting again with the same KEY
+# would silently destroy the previous work's demand.md and design.md. Starting over
+# has to go through scripts/redo, which is what leaves a backup branch.
+#
+# --check creates nothing and only judges. It is there to catch a collision
+# *before* a worktree is created, saving wasted work. The real creation must happen
+# inside the worktree.
+#
+# Usage: scripts/work-init [--check] <KEY>
+#   exit 0  usable (--check) / created (prints the path)
+#   exit 1  already exists
+#   exit 2  unusable KEY / usage error
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=plugins/cue-dev/skills/using-cue/scripts/common
+. "$SCRIPT_DIR/common"
+
+check_only=0
+if [ "${1:-}" = "--check" ]; then
+  check_only=1
+  shift
+fi
+
+if [ $# -ne 1 ]; then
+  echo "usage: scripts/work-init [--check] <KEY>" >&2
+  exit 2
+fi
+
+key=$1
+
+if ! cue_key_is_safe "$key"; then
+  echo "not usable as a KEY: '$key'" >&2
+  echo "A KEY must be non-empty and free of slashes, backslashes, spaces, and quotes." >&2
+  exit 2
+fi
+
+if cue_key_is_reserved "$key"; then
+  echo "reserved name: '$key'" >&2
+  echo "cue-dev already uses this name under .cue/dev/ ($CUE_RESERVED_KEYS)." >&2
+  echo "Pick a different KEY." >&2
+  exit 2
+fi
+
+work=$(cue_work_dir "$key")
+
+if [ -d "$work" ]; then
+  echo "work already exists: $key" >&2
+  echo "To start over, rewind with scripts/redo demand $key — it leaves a backup branch." >&2
+  exit 1
+fi
+
+if [ "$check_only" -eq 1 ]; then
+  exit 0
+fi
+
+mkdir -p "$work"
+printf '%s\n' "$work"
+
+# The first line prints the path alone (the machine-readable contract). Isolation
+# is reported on the line below it.
+#
+# This script runs inside the workspace right after it is settled — the one moment
+# when isolation is definitively known. Without printing it here, /cue-dev:start's
+# completion notice would rest on remembering "did we create a worktree?"
+printf 'isolation  %s\n' "$(cue_isolation)"
+
+# The branch name is printed here because there is no guarantee the requested name
+# is the one you get — native worktree tooling uses its own naming convention. A
+# request to create `cue-dev/I18N` actually produced `worktree-cue-dev+I18N` (the
+# prefix changed and `/` became `+`). This is the moment the real name is known,
+# and start records it from here (work-branch --line).
+#
+# There used to be a WARNING on this line when the KEY did not appear in the branch
+# name, because that was how the KEY was recovered later. It is recorded now, so
+# the requirement is gone rather than relaxed and the warning with it: a team whose
+# branches are called `feat/add-hello-world-test` was being told at the end of
+# start that the name it had just chosen would lose its work.
+branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || branch=""
+if [ -z "$branch" ] || [ "$branch" = HEAD ]; then
+  printf 'branch  %s  · %s\n' '(none)' \
+    'detached HEAD — a branch must exist before finish'
+else
+  printf 'branch  %s\n' "$branch"
+fi
+
+# Parallel sessions share one repository, and the sharp edge is a checkout, not a
+# repository. Separate worktrees have their own HEAD and index, so two items being
+# built at once do not collide; two sessions in the *same* checkout do, and the
+# expensive case is redo, whose `git reset --hard` rewinds whatever else is being
+# edited in that directory.
+#
+# Which of those is happening cannot be observed — cue-dev cannot see other
+# sessions. What is observable is that this item is starting unisolated in a
+# repository that has worktrees, which is the shape of exactly that mistake. Said
+# only then, on the same "print it when it is news" rule as the lines above: a
+# solo repository with no worktrees never sees it.
+if [ "$(cue_isolation_kind)" = main ]; then
+  others=$(git worktree list --porcelain 2>/dev/null | grep -c '^worktree ' || true)
+  if [ "${others:-0}" -gt 1 ]; then
+    printf 'workspace  %s\n' \
+      "shared checkout, $(( others - 1 )) worktree(s) alongside — redo here rewinds the whole directory"
+  fi
+fi

@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+# Reads and validates .cue/dev/config.
+#
+# Only *what cannot be observed* goes into config, and only what holds for the
+# whole repository. The conventions the user chose — commit marker prefix, backup
+# prefix, remote name, record language — cannot be derived from anywhere and do
+# not change between two work items. Three values have left this list for failing
+# the second half of that test: base_branch, branch_prefix and min_check are all
+# per item now, and the item's demand.md header holds them. By contrast "which stage are
+# we in", "are there markers", "how many tasks are recorded" are all answered by
+# git and the filesystem. Caching those here would manufacture the very problem
+# cue-dev exists to remove: a stale record claiming to be the current state.
+#
+# The second half of that rule is what retired `base_branch`. It was unobservable
+# and so it looked like a setting, but it differs per work item — a hotfix comes
+# off main while the feature before it came off develop — so it is settled by
+# /cue-dev:start and recorded in .cue/dev/<KEY>/demand.md instead. See
+# scripts/work-base.
+#
+# With no file, everything is the default. It runs as is with no configuration.
+#
+# Usage:
+#   config                             print every resolved value
+#   config --check                     validate only (print problems and exit 1)
+#   config --get <key>                 print one value
+#   config --set <key> <value> [--dry-run|--yes]  validate, then apply
+#
+# --set shows what will change before changing it. Some keys change how existing
+# history is found (marker_prefix, backup_prefix); those need the user's consent.
+# remote and language have no history depending on them, so they are validated and
+# applied straight away.
+#
+# The file read and written is the *main checkout's* copy — see cue_config_file.
+# Every value here is a repository-wide convention, and a worktree's own checked-out
+# copy gave each parallel item a private version of one: an init inside one
+# worktree changed the marker prefix for that item alone, and the change reached
+# everyone else only when it merged, without anyone having been asked.
+#
+# --dry-run prints exactly what --set would print, changes nothing, and **exits
+# 0**. That last part is the whole reason it exists: the preview used to be "run
+# --set with no stdin attached", which reached the consent prompt, found EOF and
+# exited 1. A preview that fails looks like the change failed. Claude announced
+# "let me show you the preview first" and the user saw an error — which is how the
+# consent step turned into a command handed back for the user to type.
+#
+# The consent itself is collected in the conversation now (an explicit question,
+# an explicit answer), and Claude then runs --yes. What is forbidden is not Claude
+# running --yes; it is running it without having asked. `echo yes |` is the same
+# act as never asking, because nothing was shown to anyone.
+#
+#   exit 0  ok (applied, or previewed with --dry-run)
+#   exit 1  validation failed / cancelled
+#   exit 2  usage error / not a repository
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=plugins/cue-dev/skills/using-cue/scripts/common
+. "$SCRIPT_DIR/common"
+
+# Marker lookups sweep the history several times. Read it once in the main shell.
+cue_log_load
+
+cue_repo_root >/dev/null || exit 2
+# The main checkout's copy, not this worktree's. See cue_config_file — a
+# convention read from a branch-scoped file is not a convention.
+file=$(cue_config_file) || exit 2
+
+# Applies key=value to the file. Replaces an existing line, appends if there is
+# none. Comments and other keys are left alone — notes the user wrote must not
+# disappear.
+config_put() {
+  local key=$1 val=$2 tmp
+  mkdir -p "$(dirname "$file")"
+  [ -f "$file" ] || : > "$file"
+  tmp="$file.tmp$$"
+  cue_config_invalidate   # the file changes — drop the process cache
+  if grep -q "^[[:space:]]*${key}[[:space:]]*=" "$file"; then
+    sed "s|^[[:space:]]*${key}[[:space:]]*=.*|${key}=${val}|" "$file" > "$tmp"
+  else
+    cat "$file" > "$tmp"
+    printf '%s=%s\n' "$key" "$val" >> "$tmp"
+  fi
+  mv "$tmp" "$file"
+}
+
+case "${1:-}" in
+  --set)
+    shift
+    assume_yes=0
+    dry_run=0
+    args=()
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --yes) assume_yes=1 ;;
+        --dry-run) dry_run=1 ;;
+        -*) echo "usage: config --set <key> <value> [--dry-run|--yes]" >&2; exit 2 ;;
+        *) args+=("$1") ;;
+      esac
+      shift
+    done
+    [ "${#args[@]}" -eq 2 ] || { echo "usage: config --set <key> <value> [--dry-run|--yes]" >&2; exit 2; }
+    key=${args[0]}; new=${args[1]}
+
+    # Refused by name rather than by falling through to "unknown key". A
+    # repository that still carries this line is still read (see
+    # cue_item_check_resolved) — what must not happen is a *new* one being written,
+    # because the moment it is, one number is deciding for every item again and the
+    # two worktrees running side by side are back to overwriting each other's
+    # answer.
+    if [ "$key" = min_check ]; then
+      echo "the check level is per work item, not a setting: scripts/work-check <KEY>" >&2
+      echo "/cue-dev:start asks it and records it in that item's demand.md header." >&2
+      echo "(an existing min_check line is still honoured for items started before the move)" >&2
+      exit 2
+    fi
+
+    old=$(cue_config_get "$key" "$(cue_config_default "$key")")
+
+    if ! problem=$(cue_validate_value "$key" "$new"); then
+      echo "$problem" >&2
+      exit 1
+    fi
+    if [ "$old" = "$new" ]; then
+      echo "already '$new'. Nothing to change."
+      exit 0
+    fi
+
+    echo "config change: $key"
+    printf '  current  %s\n' "$old"
+    printf '  new      %s\n' "$new"
+
+    needs_consent=0
+    case "$key" in
+      marker_prefix)
+        needs_consent=1
+        n=$(cue_count_markers "$old")
+        echo
+        printf '  The %s prefix has stamped %s markers in this repository.\n' "$old" "$n"
+        if [ "$n" -gt 0 ]; then
+          echo "  '$old' goes into marker_prefix_history — old markers stay findable."
+          echo "  Only newly stamped markers use '$new'."
+        fi
+        echo "  The whole team reads this history. This changes the commit convention — make sure the value is agreed."
+        ;;
+      backup_prefix)
+        # The one prefix left that cue-dev owns end to end: it creates these
+        # branches and finds them again by globbing this value, so changing it
+        # orphans every existing one. Marker prefixes get a history list for the
+        # same reason; backups get a warning instead, because a backup nobody can
+        # find is still on `git branch` and a marker nobody can find is gone.
+        needs_consent=1
+        stale=$(git for-each-ref --format='%(refname:short)' "refs/heads/${old}*" 2>/dev/null || true)
+        echo
+        if [ -n "$stale" ]; then
+          printf '  Backup branches under the current prefix (%s): %s\n' \
+            "$old" "$(printf '%s\n' "$stale" | grep -c .)"
+          printf '%s\n' "$stale" | sed 's/^/    /'
+          echo "  These stay where they are. Nothing is renamed."
+          echo "  They stop appearing in redo's older-backups list and in scripts/backups —"
+          echo "  git branch still shows them, and that becomes the only way to reach them."
+        else
+          echo "  No backup branches use the current prefix."
+        fi
+        ;;
+    esac
+
+    # A preview stops here, having changed nothing, and succeeds. Success is the
+    # point — this run is a report, and reporting a report as a failure is what
+    # made the previous preview unusable.
+    if [ "$dry_run" -eq 1 ]; then
+      echo
+      if [ "$needs_consent" -eq 1 ]; then
+        printf '  %-10sneeds the user to agree — ask, then re-run with --yes\n' consent
+      else
+        printf '  %-10sno consent needed — re-run without --dry-run to apply\n' consent
+      fi
+      printf '  %-10snothing was changed\n' preview
+      exit 0
+    fi
+
+    if [ "$needs_consent" -eq 1 ] && [ "$assume_yes" -ne 1 ]; then
+      echo
+      # Interactive use still works: a human at a terminal types yes. Claude does
+      # not reach this prompt — it previews with --dry-run, asks the user in the
+      # conversation, and passes --yes once the answer is in. With no stdin
+      # attached this is EOF, and EOF is not consent.
+      printf '  %-10stype yes to proceed: ' confirm
+      if ! read -r answer; then
+        echo
+        printf '  %-10sno input attached — ask the user, then re-run with --yes\n' confirm
+        exit 1
+      fi
+      [ "$answer" = "yes" ] || { printf '  %-10snothing was changed\n' cancelled; exit 1; }
+    fi
+
+    # Runs on both consent paths. Kept outside the prompt block on purpose: when
+    # this lived inside it, --yes applied the new prefix while silently dropping
+    # the old one from the history, and every marker stamped before the change
+    # became unfindable.
+    if [ "$key" = marker_prefix ] && [ "$(cue_count_markers "$old")" -gt 0 ]; then
+      hist=$(cue_config_get marker_prefix_history "")
+      case " $hist " in
+        *" $old "*) ;;                                   # already present
+        *) hist=$(printf '%s %s' "$old" "$hist" | sed 's/[[:space:]]*$//') ;;
+      esac
+      config_put marker_prefix_history "$hist"
+    fi
+
+    config_put "$key" "$new"
+    echo
+    echo "applied — $file"
+    echo "This file belongs in the repository. Commit it so the team shares the convention."
+    ;;
+
+  --get)
+    [ $# -eq 2 ] || { echo "usage: config --get <key>" >&2; exit 2; }
+    case "$2" in
+      marker_prefix) cue_marker_prefix ;;
+      backup_prefix) cue_backup_prefix ;;
+      remote)        cue_remote ;;
+      language)      cue_language ;;
+      min_check)
+        echo "the check level is per work item, not a setting: scripts/work-check <KEY>" >&2
+        exit 2 ;;
+      # Resolved, not read back raw. With no line in the file this answers what the
+      # repository looks like, which is the answer the caller wanted — a caller
+      # that got an empty string here would have to re-derive the observation, and
+      # a second derivation is a second chance to derive it differently.
+      integration)   cue_integration ;;
+      # Answered, but not from here. Each was a repository-wide reading of a value
+      # that belongs to the work item, and a caller reaching for one is a caller
+      # about to use one item's answer for another's.
+      base_branch|base_ref)
+        echo "the start point is per work item, not a setting: scripts/work-base <KEY>" >&2
+        exit 2 ;;
+      branch_prefix)
+        echo "the work branch is named per work item, not a setting: scripts/work-branch <KEY>" >&2
+        echo "(cue-dev's own backup branches live under: config --get backup_prefix)" >&2
+        exit 2 ;;
+      *) echo "unknown key: '$2' (marker_prefix backup_prefix remote language integration)" >&2; exit 2 ;;
+    esac
+    printf '\n'
+    ;;
+
+  --check)
+    unknown=$(cue_config_unknown_keys)
+    [ -n "$unknown" ] && {
+      echo "unrecognized keys (ignored, cue-dev reads its defaults instead):" >&2
+      for k in $unknown; do echo "  · $k" >&2; done
+    }
+    problems=$(cue_config_validate) || {
+      echo "the config has problems — $file" >&2
+      printf '%s\n' "$problems" | sed 's/^/  · /' >&2
+      exit 1
+    }
+    echo "config ok"
+    ;;
+
+  '')
+    [ -f "$file" ] && echo "config file  $file" || echo "config file  none (all defaults)"
+    printf '  marker_prefix  %s        marker form: %s\n' \
+      "$(cue_marker_prefix)" "$(cue_marker demand '<KEY>')"
+    printf '  backup_prefix  %s  (cue-dev'"'"'s own branches; the work branch is named per item)\n' \
+      "$(cue_backup_prefix)"
+    printf '  remote         %s\n' "$(cue_remote || true)"
+    printf '  language       %s\n' "$(cue_language)"
+    printf '  check          %s\n' "per work item — /cue-dev:start asks it; scripts/work-check <KEY> reads it"
+    if [ -n "$(cue_config_get min_check "")" ]; then
+      printf '  min_check      %s  (retired — still read for items started before the move)\n' \
+        "$(cue_config_get min_check "")"
+    fi
+    if [ -n "$(cue_config_get integration "")" ]; then
+      printf '  integration    %s  (set — how a change request is opened)\n' "$(cue_integration)"
+    else
+      printf '  integration    %s  (observed, not set — scripts/integration)\n' "$(cue_integration)"
+    fi
+    unknown=$(cue_config_unknown_keys)
+    if [ -n "$unknown" ]; then
+      echo
+      echo "unrecognized keys — cue-dev ignores these and reads its defaults:"
+      for k in $unknown; do echo "  · $k"; done
+    fi
+    if ! problems=$(cue_config_validate); then
+      echo
+      echo "problems:"
+      printf '%s\n' "$problems" | sed 's/^/  · /'
+      exit 1
+    fi
+    ;;
+
+  *)
+    echo "usage: config [--check | --get <key> | --set <key> <value> [--yes]]" >&2
+    exit 2
+    ;;
+esac

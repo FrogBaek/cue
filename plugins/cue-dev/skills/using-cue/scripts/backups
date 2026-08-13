@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Lists the backup branches belonging to one work item.
+#
+# scripts/redo creates one of these before every rewind, and nothing ever deletes
+# them. Two or three rewinds into a piece of work, `git branch` is mostly backups —
+# so finish asks about them once the work is done, which is the first moment they
+# are safe to drop.
+#
+# **Scoped to one KEY, always.** The branch list is shared: other work items have
+# backups of their own, sitting at the same prefix, and those are somebody else's
+# recovery path. Matching on the prefix alone would sweep them up, and a rewind
+# nobody can undo is the one failure this whole mechanism exists to prevent. The
+# KEY is the boundary and there is no flag to widen it.
+#
+# Output is plain (Claude reads it and re-speaks it, like work-init), not the
+# notice block. Nothing is deleted here — the command is printed for the user to
+# run, which is the same rule redo follows.
+#
+# Usage: scripts/backups [KEY]
+#   Omit the KEY and it is matched from the current branch name.
+#   exit 0  listed (no output when there are none)
+#   exit 2  no KEY could be determined
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=plugins/cue-dev/skills/using-cue/scripts/common
+. "$SCRIPT_DIR/common"
+
+if [ $# -gt 1 ]; then
+  echo "usage: scripts/backups [KEY]" >&2
+  exit 2
+fi
+
+key=${1:-}
+if [ -z "$key" ]; then
+  key=$(cue_key_from_branch) || {
+    echo "no KEY found from the current branch. Pass one: scripts/backups <KEY>" >&2
+    exit 2
+  }
+fi
+cue_key_is_safe "$key" || { echo "not usable as a KEY: $key" >&2; exit 2; }
+
+# The trailing `-` before the glob is what keeps `PROJ-14` from matching
+# `PROJ-142`'s backups: cue_backup_branch always appends `-<timestamp>`.
+found=$(git for-each-ref --format='%(refname:short)' \
+  "refs/heads/$(cue_backup_prefix)${key}-*" 2>/dev/null || true)
+
+[ -n "$found" ] || exit 0
+
+while IFS= read -r b; do
+  printf 'backup  %s  (%s)\n' "$b" "$(git log -1 --format=%cr "$b")"
+done <<< "$found"
+
+printf 'delete  git branch -D %s\n' "$(printf '%s\n' "$found" | paste -sd' ' -)"

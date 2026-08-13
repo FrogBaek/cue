@@ -1,0 +1,18 @@
+{
+  "name": "cue",
+  "description": "A collection of AI collaboration tools — independent plugins that each keep their own records under the project's .cue/ directory",
+  "owner": {
+    "name": "FrogBaek"
+  },
+  "plugins": [
+    {
+      "name": "cue-dev",
+      "description": "AI development workflow: records design, plan, implementation, and outcome from requirement to merge, so the reasoning survives the session that produced it",
+      "version": "0.1.0",
+      "source": "./plugins/cue-dev",
+      "author": {
+        "name": "FrogBaek"
+      }
+    }
+  ]
+}

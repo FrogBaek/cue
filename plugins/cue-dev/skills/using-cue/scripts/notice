@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# Renders the completion notice block that every stage skill ends with.
+#
+# Why a script for something a skill could write out. The templates in the skill
+# bodies are all exactly 47 columns wide — and they stay that way only until the
+# placeholder is filled in. `━━━ DESIGN done · <KEY> ━━━…` carries a 5-character
+# `<KEY>`; substituting a real one (`2026-08-04-prev-button-navigation`, 33
+# characters) pushes the opening line 28 columns past the closing rule, which is a
+# literal string that does not move. That is the ragged box users kept seeing, and
+# no amount of "remember to re-pad" fixes it, because the counting happens in prose
+# at render time.
+#
+# So the block is drawn where the width is already solved: cue_head records the
+# width the title forced and cue_rule closes at exactly that one. The same pair
+# scripts/status and scripts/redo use, so all three surfaces cannot drift.
+#
+# Claude runs this and reproduces the output verbatim in its reply. That is not
+# optional — see docs/output-format.md. The block is one of the few things a user
+# reads unaltered.
+#
+# Usage: scripts/notice <title> < body
+#
+#   The title is one of a closed set (see CUE_NOTICE_TITLES below) and carries no
+#   KEY. The KEY goes in the body, on a `key` line, like every other value.
+#
+#   Each body line is `<label> <value...>`; the label is the first whitespace-
+#   delimited word and the value is everything after it. A blank line stays blank,
+#   which is how the state group is separated from the action group.
+#
+#   A line indented deeper than the first one is a continuation and prints with an
+#   empty label — plan's notice lists two artifacts under one `artifacts` label.
+#   The indent is measured against the first body line, so a heredoc written flush
+#   left and one indented inside a skill body behave the same.
+#
+#   `@cleanup <KEY>` is the one line that is not a line. It is replaced by the
+#   workspace lines for that item, read from scripts/finish-cleanup --verify at
+#   the moment the box is drawn. Use it wherever the box reports a retired
+#   workspace; see the comment at the substitution below for why it is not a
+#   thing the caller writes out.
+#
+#   A label is one word. `look up` prints as label `look`, value `up …`, which is
+#   what it looks like: a box with a stray word in the gutter.
+#
+#   scripts/notice "DESIGN done" <<'EOF'
+#   key       PROJ-142
+#   artifact  .cue/dev/PROJ-142/design.md
+#   commit    cue-dev(design): PROJ-142
+#
+#   next      /cue-dev:plan
+#   rewind    /cue-dev:redo design
+#   EOF
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=plugins/cue-dev/skills/using-cue/scripts/common
+. "$SCRIPT_DIR/common"
+
+# The titles that exist. Nothing else may be drawn in this frame.
+#
+# The box is a trust signal, and a trust signal anyone can draw is decoration. In a
+# real session Claude hand-rendered `━━━ MERGED · <KEY> ━━━` for a merge it had
+# performed *outside* /cue-dev:finish — naming a stage that does not exist and
+# reporting a result nothing had checked. It was indistinguishable from the six
+# real boxes, because until now the only thing a title had to be was a string.
+#
+# A stage that wants a notice adds itself to this list, in the repository, under
+# review. A title invented at render time cannot get through, and that is the whole
+# defence: the frame now means "a cue-dev stage produced this", deterministically.
+#
+# `MERGE done` is that rule working as intended rather than an exception to it.
+# finish's Step 9 is now a real step with a script behind it — it takes the merge
+# lock, runs the merge, verifies the tests and cleans up — so it has something to
+# report and it says so here, under review, in the list's own `X done` shape. What
+# it is not is the invented title above: a merge performed outside Step 9 still has
+# no box, and `MERGED` is still refused.
+#
+# `REQUEST done` arrived with it, and for the same reason. Opening a change request
+# used to happen inside finish's menu, so its result went into the `FINISH done`
+# box — which meant that box reported two different things depending on a choice,
+# and finishing the item was tangled up with proposing it. Both integration acts
+# are now asked after the notice, as one question, so both report their own result:
+# 9b prints this and 9c prints `MERGE done`. A push done anywhere else is still
+# ordinary prose with no box at all.
+#
+# The list is an array and the message is derived from it, because for a while it
+# was two copies — this string and a `case` pattern below — and adding `MERGE done`
+# to one of them produced a script that named the title in its own refusal message.
+# A whitelist that can disagree with itself is worse than no whitelist: the failure
+# is invisible until a real stage cannot print its own box.
+CUE_NOTICE_TITLE_LIST=(
+  'INIT done' 'START done' 'DESIGN done' 'PLAN done'
+  'IMPLEMENT done' 'FINISH done' 'REQUEST done' 'MERGE done'
+)
+CUE_NOTICE_TITLES=$(printf '%s · ' "${CUE_NOTICE_TITLE_LIST[@]}")
+CUE_NOTICE_TITLES=${CUE_NOTICE_TITLES% · }
+
+if [ $# -ne 1 ] || [ -z "$1" ]; then
+  echo "usage: scripts/notice <title> < body" >&2
+  exit 2
+fi
+
+listed=0
+for _title in "${CUE_NOTICE_TITLE_LIST[@]}"; do
+  [ "$1" = "$_title" ] && { listed=1; break; }
+done
+if [ "$listed" -eq 0 ]; then
+  echo "not a cue-dev stage notice: '$1'" >&2
+  echo "the frame is reserved for these titles: $CUE_NOTICE_TITLES" >&2
+  echo "the KEY belongs in the body, on a 'key' line — not in the title" >&2
+  echo "reporting anything else? write it as ordinary prose, without the box" >&2
+  exit 2
+fi
+
+cue_head "$1"
+echo
+
+# read without -r would eat backslashes out of Windows paths.
+base_indent=""
+base_seen=0
+while IFS= read -r line || [ -n "$line" ]; do
+  line=${line%$'\r'}                        # written on Windows, it carries a CR
+  stripped=${line#"${line%%[![:space:]]*}"} # the heredoc in a skill body is indented
+  if [ -z "$stripped" ]; then
+    echo
+    continue
+  fi
+  indent=${line%"$stripped"}
+  # A flag, not `[ -n "$base_indent" ]` — a heredoc written flush left has an
+  # empty first indent, and the emptiness test would then keep re-arming until
+  # the first indented line, which is the continuation line. It would become the
+  # baseline and lose its label.
+  if [ "$base_seen" -eq 0 ]; then
+    base_indent=$indent
+    base_seen=1
+  fi
+
+  if [ "${#indent}" -gt "${#base_indent}" ]; then
+    printf '  %-10s%s\n' '' "$stripped"     # a continuation of the line above
+    continue
+  fi
+  label=${stripped%%[[:space:]]*}
+  value=${stripped#"$label"}
+  value=${value#"${value%%[![:space:]]*}"}
+
+  # `@cleanup <KEY>` is not a line — it is the workspace lines, observed here
+  # rather than remembered.
+  #
+  # Step 8 has said "copy what finish-cleanup printed, do not write these two
+  # lines from what you meant to happen" for two releases, in bold, with the
+  # session that got it wrong described underneath. It was written from memory
+  # again anyway: `worktree  .worktrees/<KEY> (removed)` went into a FINISH box
+  # over a directory finish-cleanup had just refused to remove and said so, and
+  # then `worktree  removed` went into the MERGE box after it. Both boxes were
+  # true about the intent and false about the disk.
+  #
+  # An instruction cannot win that, because the correct line and the invented one
+  # are the same shape and the invented one is available without scrolling up. So
+  # there is nothing left to copy: the token names the KEY, and the answer is
+  # re-observed at the moment the box is drawn — which is also later than the
+  # observation Step 7 made, and therefore more true.
+  #
+  # --verify because this is a report: it prunes and clears an empty leftover,
+  # which is what observing an unregistered worktree means, and removes nothing
+  # else. Its exit code is the state of the workspace, not of this script.
+  if [ "$label" = '@cleanup' ] && [ -n "$value" ]; then
+    while IFS= read -r cleanup_line; do
+      [ -n "$cleanup_line" ] || continue
+      cleanup_line=${cleanup_line#"${cleanup_line%%[![:space:]]*}"}
+      cleanup_label=${cleanup_line%%[[:space:]]*}
+      cleanup_value=${cleanup_line#"$cleanup_label"}
+      cleanup_value=${cleanup_value#"${cleanup_value%%[![:space:]]*}"}
+      printf '  %-10s%s\n' "$cleanup_label" "$cleanup_value"
+    done < <("$SCRIPT_DIR/finish-cleanup" --verify "$value" 2>/dev/null || true)
+    continue
+  fi
+
+  printf '  %-10s%s\n' "$label" "$value"
+done
+
+cue_rule

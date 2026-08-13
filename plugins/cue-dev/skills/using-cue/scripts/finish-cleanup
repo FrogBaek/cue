@@ -1,0 +1,369 @@
+#!/usr/bin/env bash
+# Retires the workspace a finished item was built in, and reports what actually
+# happened in the words the completion notice uses.
+#
+# Why this is a script. /cue-dev:finish used to carry the whole procedure as prose
+# — capture three path variables, ask git whether the worktree is registered,
+# decide from the path who owns it, remove it, then look again to see whether it
+# really went. In a real session that produced `worktree preserved` on the path
+# where the user had explicitly chosen to clean the worktree up: nothing was
+# removed, the harness's exit tool was never called, and the notice reported the
+# non-removal as if it had been the plan. The scratch directory was still there
+# too, because no step in cue-dev has ever deleted it.
+#
+# Two failures, one shape: a sequence of observations kept in prose, where the
+# report is written from memory rather than from the last observation. So the
+# observing and the reporting move here, together.
+#
+# It takes the KEY, not a path. The path comes from that item's record — the one
+# place it is unambiguous — so a finish running in a later session, from the main
+# checkout, cleans up the right directory instead of whatever `--show-toplevel`
+# answers where it happens to be standing.
+#
+# Usage:
+#   scripts/finish-cleanup <KEY>
+#   scripts/finish-cleanup --verify <KEY>
+#   scripts/finish-cleanup --force <KEY>
+#
+#   The first form removes the scratch, then removes the worktree when the record
+#   says cue-dev made it. A worktree cue-dev did not make is reported and left
+#   alone — see `owner` below. A worktree holding uncommitted or untracked files is
+#   also left alone, and what is in it is listed: see the dirty check below for why
+#   that is not an inconvenience to route around.
+#
+#   --verify observes only: prune, remove an empty leftover, and report whether
+#   the directory is gone.
+#
+#   --force removes it anyway. Only ever after showing the user that list and
+#   getting an answer — it exists so that consent can be carried out, not so that
+#   the question can be skipped.
+#
+#   Output is label-and-value lines for the notice. Copy them as they come; do
+#   not restate them.
+#
+#   exit 0  the workspace is clean, or the harness has to act next (see `action`)
+#   exit 1  something is still there — the `worktree` line says what
+#   exit 2  usage error
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=plugins/cue-dev/skills/using-cue/scripts/common
+. "$SCRIPT_DIR/common"
+
+verify_only=0
+force=0
+key=""
+# The flag may come after the KEY. It used to have to come first — `finish-cleanup
+# <KEY> --force` broke out of the loop on the KEY and then failed the arity check
+# with a usage line that showed the flags before the KEY and did not say that the
+# order was the problem. A real session read that as "--force does not exist here",
+# retried with the flag in front, and got the same refusal it was already getting.
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --verify) verify_only=1 ;;
+    --force)  force=1 ;;
+    -*) echo "usage: scripts/finish-cleanup [--verify] [--force] <KEY>" >&2; exit 2 ;;
+    *)  [ -z "$key" ] || { echo "usage: scripts/finish-cleanup [--verify] [--force] <KEY>" >&2; exit 2; }
+        key=$1 ;;
+  esac
+  shift
+done
+
+[ -n "$key" ] || {
+  echo "usage: scripts/finish-cleanup [--verify] [--force] <KEY>" >&2
+  exit 2
+}
+cue_key_is_safe "$key" || { echo "not usable as a KEY: $key" >&2; exit 2; }
+
+# Every path in this script is normalized through `cd && pwd -P`. `git worktree
+# list` prints `D:/repo/...` while `pwd` gives `/d/repo/...` on Git Bash, and a
+# comparison between the two forms silently disagrees on Windows only.
+norm() { (cd "$1" 2>/dev/null && pwd -P); }
+
+main_root=$(cue_main_root) || exit 2
+
+# Is there a record for this item at all? Ask before reading anything out of it.
+#
+# This used to be skipped, and the gap it left cost a whole run. finish runs in
+# the main checkout by design, and an item that has not merged yet has no
+# `.cue/dev/<KEY>/` there — its record is committed on its own branch. Every
+# lookup came back empty, the empty answer was read as "this item has no
+# worktree", and the script exited 0 having removed nothing. The notice then
+# reported a settled workspace over a second full checkout that was still on
+# disk, `git branch -d` failed on it two steps later, and the removal was
+# finished by hand, outside every guard in this file.
+#
+# cue_item_header_field reads the record off the item's branch now, so the lookup
+# below usually succeeds where it used to fail. This check is the floor under it:
+# no record anywhere means the question was not answered, and an unanswered
+# question must not leave here as a fact.
+if ! cue_item_record_exists "$key"; then
+  printf '  %-10s%s\n' worktree "unknown — no record for $key in this repository"
+  printf '  %-10s%s\n' action "nothing was removed; check the KEY, or the branch this item was built on"
+  exit 1
+fi
+
+# The recorded worktree. Its absence is an answer now that the line above has
+# established the record exists: the item was built in the main checkout, and
+# there is nothing here to remove.
+recorded=$(cue_item_worktree "$key" 2>/dev/null || true)
+
+if [ -z "$recorded" ]; then
+  # Before saying "no worktree", look where cue-dev would have put one. A record
+  # written before this field existed, or one edited by hand, has no worktree
+  # line — and answering "none" over a directory that is sitting right there is
+  # the failure this whole script was rewritten for.
+  canonical=$(cue_worktree_path "$key")
+  if [ -d "$canonical" ]; then
+    printf '  %-10s%s\n' worktree "present — $canonical"
+    printf '  %-10s%s\n' note "the record has no worktree line, so cue-dev will not remove it for you"
+    printf '  %-10s%s\n' action "repair the record with: work-path --line $canonical, or remove the directory yourself"
+    exit 1
+  fi
+fi
+
+if [ -z "$recorded" ]; then
+  # Still worth clearing the scratch, which lives in whatever checkout the work
+  # was done in — including this one.
+  if [ "$verify_only" -eq 0 ]; then
+    scratch="$(cue_repo_root)/.cue/dev/sdd"
+    if [ -d "$scratch" ]; then
+      rm -rf "$scratch"
+      printf '  %-10s%s\n' scratch "removed — .cue/dev/sdd/"
+    else
+      printf '  %-10s%s\n' scratch "none"
+    fi
+  fi
+  if [ "$(cue_isolation_kind)" = worktree ]; then
+    # Unknown, and unknown is where this script used to guess. It defaulted to
+    # `harness`, which reads as "someone else will clean this up" — and in the
+    # one session that exercised it, nobody did. Say what is true and stop.
+    printf '  %-10s%s\n' worktree "not cue-dev's — $(cue_repo_root)"
+    printf '  %-10s%s\n' action "nothing recorded for $key; whoever made this worktree removes it"
+  else
+    printf '  %-10s%s\n' worktree "none — this item has no worktree"
+  fi
+  exit 0
+fi
+
+path=$(norm "$recorded" || true)
+if [ -z "$path" ]; then
+  # Already gone. That is the goal state, so it is not a failure.
+  #
+  # The empty parent is cleared here too. This path is reached whenever the
+  # worktree went by some other route — a `git worktree remove` by hand, a
+  # harness, an earlier run of this script whose own rmdir lost a race with a
+  # Windows lock — and every one of those leaves `.worktrees/` behind, because
+  # the parent cleanup further down never runs. A real repository carried an
+  # empty `.worktrees/` for two sessions on exactly that path.
+  parent=$(dirname "$recorded")
+  case "$parent" in
+    "$main_root"/*) rmdir "$parent" 2>/dev/null || true ;;
+  esac
+  printf '  %-10s%s\n' worktree "already gone — $recorded"
+  exit 0
+fi
+
+# Stand outside before touching anything. `git worktree remove` refuses to run
+# from inside the worktree it is removing, and the caller may well be in there —
+# that is where the work was done. Both paths this script uses are absolute
+# already, so leaving costs nothing.
+cd "$main_root"
+
+# Whether git is still tracking this path as a linked worktree.
+#
+# The two states need opposite treatment and cannot be told apart from the path
+# string: a harness can unregister a worktree and leave the directory behind, and
+# `git worktree remove` on an unregistered path fails with `is not a working
+# tree`. That failure was reported as success once already.
+registered=no
+while IFS= read -r line; do
+  case "$line" in
+    'worktree '*)
+      wt=$(norm "${line#worktree }" || true)
+      [ -n "$wt" ] && [ "$wt" = "$path" ] && registered=yes
+      ;;
+  esac
+done < <(git worktree list --porcelain 2>/dev/null || true)
+
+# Who created it. There is nothing to work out any more: the path came from the
+# item's own record, and cue-dev is what wrote that line — at the moment the
+# worktree was cut, which is the only moment the answer is not a guess.
+#
+# This used to be a case over path patterns with `harness` as the default, and
+# every part of that was wrong. `.cue/worktrees/<KEY>` matched none of the
+# patterns and fell through to the default; the default named an owner who was
+# never going to act; and the harness's real worktrees turned out not to live
+# under `.claude/` at all but under
+# `AppData/Local/Temp/claude/<slug>/<session>/worktree`. The check was right only
+# when its default happened to be right.
+#
+# The one guard left is the repository itself. A record pointing at the main root
+# would hand this script the whole checkout to remove, so it is refused rather
+# than acted on.
+owner=cue-dev
+[ "$path" = "$main_root" ] && owner=none
+
+# --- what would be destroyed --------------------------------------------------
+#
+# Asked before anything is removed, including the scratch, because the answer can
+# stop the whole run.
+#
+# `git worktree remove --force` discards uncommitted changes without a word, and
+# that is how a generated page was once lost: a stage wrote a file under
+# .cue/dev/<KEY>/, no step committed it, and finish removed the worktree it was
+# sitting in. Nothing in either script was wrong about its own job — the removal
+# simply assumed everything worth keeping was already in git.
+#
+# This check is for the general case, which is not going away: a worktree is where
+# the work happened, and a session can leave anything in it. The rule this script already
+# applies to directories — `rmdir`, which refuses a directory that still holds
+# files, because "whatever is in it, nobody asked for it to be deleted" — is the
+# rule the removal itself was missing.
+#
+# Untracked files count. `--force` deletes them too, and an uncommitted file and an
+# unadded one are the same loss to whoever wrote it.
+#
+# The scratch is excluded, and it has to be excluded by path rather than by
+# gitignore. `.cue/dev/sdd/` is ignored in a repository /cue-dev:init prepared, so
+# it would not appear here at all — but the ignore rule is a recommendation, not a
+# requirement, and in a repository without it the scratch is untracked. Then every
+# single finish would stop to ask about the one directory this script is certain
+# nobody wants, which is how a check that fires on everything stops being read.
+#
+# `--untracked-files=all` for the same reason: with `normal`, an untracked `.cue/`
+# collapses to one entry covering the scratch and anything beside it, and there is
+# no way to tell which.
+dirty=""
+if [ "$verify_only" -eq 0 ] && [ "$force" -eq 0 ]; then
+  dirty=$(git -C "$path" status --porcelain --untracked-files=all 2>/dev/null \
+            | grep -v '[[:space:]]\.cue/dev/sdd/' || true)
+fi
+
+if [ -n "$dirty" ]; then
+  printf '  %-10s%s\n' worktree "kept — $path"
+  # Every label in this frame fits the 10-column gutter. `uncommitted` is eleven
+  # and ran into its own value.
+  printf '  %-10s%s\n' holds "$(printf '%s\n' "$dirty" | grep -c .) uncommitted file(s) — removing the worktree would destroy them"
+  printf '%s\n' "$dirty" | sed 's/^/               /'
+  printf '  %-10s%s\n' action "commit them, or discard them deliberately, then run finish-cleanup again"
+  printf '  %-10s%s\n' note "nothing was removed — not the worktree and not the scratch"
+  exit 1
+fi
+
+# The scratch. It is gitignored, it lives inside the worktree, and until now
+# nothing deleted it — so every finished item left a `sdd/` behind, and every new
+# worktree grew a fresh one. It holds task briefs, implementer reports, review
+# packages: all of it derived.
+#
+# **This is the earliest point it may go, and /cue-dev:implement used to delete it
+# earlier.** The implementer reports are what `scripts/evidence` counts when the
+# question "did the independent review actually happen" is asked — at the end of
+# implement, and again at this skill's Step 1, both of which are behind us by the
+# time this line runs. Deleted at the end of implement, that count was zero for
+# every item by the time anyone could ask. Do not move this back.
+#
+# Below the dirty check on purpose, and gitignored so it never appears in it: it is
+# the one thing here cue-dev is certain nobody wants.
+#
+# Skipped on --verify, which observes and does not act.
+if [ "$verify_only" -eq 0 ]; then
+  scratch="$path/.cue/dev/sdd"
+  if [ -d "$scratch" ]; then
+    # Scoped to one directory whose every byte cue-dev wrote. `rm -rf` is right
+    # here and nowhere else in this script.
+    rm -rf "$scratch"
+    printf '  %-10s%s\n' scratch "removed — .cue/dev/sdd/"
+  else
+    printf '  %-10s%s\n' scratch "none"
+  fi
+fi
+
+if [ "$owner" = none ]; then
+  printf '  %-10s%s\n' worktree "none — the record points at the main checkout"
+  printf '  %-10s%s\n' action "repair it with: work-path $key  (nothing was removed)"
+  exit 1
+fi
+
+# How much there is to delete, said before deleting it.
+#
+# The removal is a file-by-file unlink of everything in the worktree, including
+# whatever the build put there — and a dependency directory is tens of thousands
+# of files. Measured on the machine this was written on: 8,201 files took 41
+# seconds to remove, about 200 a second, and the same removal on a faster volume
+# ran nine times quicker. A React worktree's node_modules is several times larger
+# again.
+#
+# So this step can run for many minutes, and every second of it is silent. In a
+# real session it passed the harness's 120-second ceiling, was moved to the
+# background, and starved the rest of the session for disk: a bare `git log`
+# issued right after it took fifteen minutes to return. The user read that as
+# cue-dev hanging, which is the right reading of a step that says nothing while
+# taking a quarter of an hour.
+#
+# Nothing here is faster — the files have to go. What was missing was the number,
+# printed while it can still explain the wait rather than after it.
+#
+# Only when it is large enough to be the explanation. Counting is a stat walk and
+# costs a fraction of the unlink it precedes, but a `4 files` line on every
+# ordinary finish is one more line nobody reads.
+if [ "$verify_only" -eq 0 ]; then
+  files=$(find "$path" -type f 2>/dev/null | wc -l | tr -d ' ')
+  if [ "${files:-0}" -gt 5000 ]; then
+    printf '  %-10s%s\n' size "$files files to remove — this takes minutes, and says nothing while it runs"
+  fi
+fi
+
+if [ "$verify_only" -eq 0 ] && [ "$registered" = yes ]; then
+  git worktree remove --force "$path" 2>/dev/null || true
+fi
+git worktree prune 2>/dev/null || true
+
+# `rmdir` and not `rm -rf`: it clears an empty leftover — which is what a removal
+# that unregistered without deleting leaves behind — and refuses a directory that
+# still holds files. Refusing is the right answer there; whatever is in it,
+# nobody asked for it to be deleted.
+#
+# Retried, and only on Windows does that matter. `git worktree remove` had just
+# emptied this directory when a second process still held a handle on it, and the
+# unlink failed with `Device or resource busy` over a directory with nothing in
+# it. The lock clears on its own in well under a second — the same directory
+# removed on the first try from a later session. One attempt turned a transient
+# lock into a permanent-looking failure, and the run that hit it went on to report
+# the worktree as removed anyway.
+for _ in 1 2 3 4; do
+  [ -d "$path" ] || break
+  rmdir "$path" 2>/dev/null || true
+  [ -d "$path" ] || break
+  sleep 0.3
+done
+
+# The parent too, and only when empty. `.worktrees/` is cue-dev's own directory
+# and an empty one is litter — a real session left it sitting there after the
+# worktree inside it went, because this script only ever looked at `$path`.
+# rmdir refuses a parent that still holds another item's worktree, which is
+# exactly the case where it must not go.
+parent=$(dirname "$path")
+case "$parent" in
+  "$main_root"/*) rmdir "$parent" 2>/dev/null || true ;;
+esac
+
+if [ -d "$path" ]; then
+  # Empty and still there is a different fact from full and still there, and one
+  # line answered both. A session was told to "look at what is inside it" about a
+  # directory with nothing inside it, found nothing, and concluded the message was
+  # wrong rather than that the state was unusual — then removed the worktree by
+  # hand, outside every guard above, and reported it as cleaned up.
+  if [ -z "$(ls -A "$path" 2>/dev/null)" ]; then
+    printf '  %-10s%s\n' worktree "unlinked, empty directory left — $path"
+    printf '  %-10s%s\n' cause "the OS refused to remove it; on Windows another process still holds it"
+    printf '  %-10s%s\n' action "git is done with it — delete the directory when the lock clears, or leave it"
+  else
+    printf '  %-10s%s\n' worktree "still present — $path"
+    printf '  %-10s%s\n' action "look at what is inside it; cue-dev will not delete it for you"
+  fi
+  exit 1
+fi
+
+printf '  %-10s%s\n' worktree "removed — $path"
+exit 0

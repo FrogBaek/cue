@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# Writes the empty frame of design.md or plan.md, so nobody has to transcribe it.
+#
+# Why this is a script. Both templates lived only in their skill's prose, and both
+# stages kept failing `scripts/verify` on the same thing: a heading or a field name
+# translated into the record language. `**Goal:**` was written `**목표:**`,
+# `Planned contract changes` was answered `없음`. Neither was carelessness — the
+# skills say prose follows the record language and then hand over a template made
+# of prose and structure with nothing marking which is which. A real session lost
+# two full rewrites of plan.md to it, one of them a complete Write of the file.
+#
+# The fix is not a firmer instruction about which words are exempt. It is to stop
+# asking anyone to copy the structure at all: this script emits every fixed token
+# — headings, field names, the marker literals verify greps for — and the model
+# fills in the prose between them. What cannot be translated is never typed.
+#
+# Fill-me spots are marked `[[ ... ]]`. `scripts/verify` errors on any that
+# survive, so an unfilled frame cannot reach a commit.
+#
+# Usage:
+#   scripts/skeleton design <KEY>
+#   scripts/skeleton plan <KEY> <task-count>
+#   scripts/skeleton <stage> <KEY> ... --force     overwrite an existing file
+#
+#   exit 0  written
+#   exit 1  the file already exists (use --force), or no such work
+#   exit 2  usage error
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=plugins/cue-dev/skills/using-cue/scripts/common
+. "$SCRIPT_DIR/common"
+
+force=0
+args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --force) force=1; shift ;;
+    -*) echo "usage: scripts/skeleton design|plan <KEY> [<task-count>] [--force]" >&2; exit 2 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+set -- ${args[@]+"${args[@]}"}
+
+[ $# -ge 2 ] || { echo "usage: scripts/skeleton design|plan <KEY> [<task-count>] [--force]" >&2; exit 2; }
+stage=$1
+key=$2
+cue_key_is_safe "$key" || { echo "not usable as a KEY: $key" >&2; exit 2; }
+
+work=$(cue_work_dir "$key")
+[ -d "$work" ] || { echo "work not found: $key (no $work)" >&2; exit 1; }
+
+out="$work/$stage.md"
+if [ -f "$out" ] && [ "$force" -ne 1 ]; then
+  echo "$stage.md already exists: $out" >&2
+  echo "rewriting it is /cue-dev:redo $stage; --force is for a frame you have not filled in yet" >&2
+  exit 1
+fi
+
+today=$(date +%Y-%m-%d)
+
+case "$stage" in
+  design)
+    [ $# -eq 2 ] || { echo "usage: scripts/skeleton design <KEY>" >&2; exit 2; }
+    cat > "$out" <<EOF
+> [[ in the record language: This document reflects the judgment as of $today and is not updated. ]]
+> [[ in the record language: For the current system structure, see the project documentation. ]]
+
+## Structure
+
+[[ mermaid diagram of what this work changes in the system layout — the delta
+only. If the work changes no structure, write that it does not and draw nothing.
+Do not drop the heading: "nothing moves" is a claim the reviewer wants to see
+made. ]]
+
+> [[ in the record language: This diagram is design intent, not the current architecture. ]]
+
+## What we build
+
+[[ two or three sentences ]]
+
+## Worked example
+
+[[ one concrete value going through the system: what goes in, what happens, what
+comes out. Real values a log line could carry — ttl=3600, session-4f21 — not
+<some id>. Three to ten lines. ]]
+
+## Why this way
+
+[[ the substance of the review; this section and the next may run longer than the
+others ]]
+
+## Rejected alternatives
+
+- [[ alternative ]]: [[ why it was dropped, as the reasoning stood at the time.
+  If there was genuinely one approach, say so and why the space was narrow —
+  that is a real entry. Never invent an alternative to fill this in. ]]
+
+## Divergence from demand
+
+none
+
+## Constraints at the time
+
+[[ performance requirements · state of the existing code · schedule · team
+practice ]]
+
+## Program design
+
+- [[ modules and responsibility boundaries · interface signatures
+  (Produces/Consumes) · dependency direction · error handling ]]
+
+## How we know it works
+
+- [[ what decides that this is done, and whether that check runs by itself. Name
+  a check, not a hope. ]]
+
+## Planned contract changes
+
+none
+EOF
+    ;;
+
+  plan)
+    [ $# -eq 3 ] || { echo "usage: scripts/skeleton plan <KEY> <task-count>" >&2; exit 2; }
+    n=$3
+    case "$n" in
+      ''|*[!0-9]*) echo "task count must be a number: $n" >&2; exit 2 ;;
+    esac
+    [ "$n" -ge 1 ] || { echo "task count must be at least 1" >&2; exit 2; }
+
+    {
+      cat <<'EOF'
+# [[ feature name ]] Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use cue-dev:implement to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** [[ one sentence: what this builds ]]
+
+**Architecture:** [[ two or three sentences: the approach ]]
+
+**Tech Stack:** [[ the key technologies and libraries ]]
+
+## Global Constraints
+
+- [[ one line each, with exact values copied verbatim from the design — version
+  floors, dependency limits, naming and copy rules, platform requirements. Every
+  task's requirements implicitly include this section. Write "none" if there are
+  none. ]]
+
+---
+EOF
+      i=1
+      while [ "$i" -le "$n" ]; do
+        cat <<EOF
+
+### Task $i: [[ component name ]]
+
+**Files:**
+- Create: \`[[ exact/path/to/file ]]\`
+- Modify: \`[[ exact/path/to/existing:123-145 ]]\`
+- Test: \`[[ tests/exact/path/to/test ]]\`
+
+**Interfaces:**
+- Consumes: [[ exact signatures this task uses from earlier tasks, or "none" ]]
+- Produces: [[ exact signatures later tasks rely on, or "none". These are matched
+  as strings against the next task's Consumes — paraphrase and the dependency
+  graph goes silently empty. ]]
+
+**TDD:** [[ evidence-only | required | n/a ]]
+
+- [ ] **Step 1: [[ what this step does ]]**
+
+[[ the actual content an engineer needs — the code, the command to run, the
+output to expect. Add as many steps as the task takes. ]]
+EOF
+        i=$((i + 1))
+      done
+    } > "$out"
+    ;;
+
+  *)
+    echo "no skeleton for stage: $stage (design or plan)" >&2
+    exit 2
+    ;;
+esac
+
+printf '%s\n' "$out"
+printf '  %-10s%s\n' fill "every [[ ... ]] — verify errors on any that survive"
+printf '  %-10s%s\n' keep "headings, field names and the literals around them are structure — do not translate them"

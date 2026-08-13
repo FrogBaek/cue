@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+# Answers one question before a stage skill does anything: may this stage run
+# here, and if not, what can?
+#
+# Why this exists. Every stage rests on the one before it — design reads demand,
+# plan reads design, finish reads a plan that was implemented. When a stage was
+# invoked out of order the skills had no shared way to say so, so each of them
+# discovered it separately, in the middle of doing something. `/cue-dev:status` in
+# a repository where nothing had been started printed
+#
+#     no KEY found from the current branch. Pass one: scripts/status <KEY>
+#
+# and exited 2 — accurate, and useless. It says what failed, not what to do, so
+# the controller retried it with a guessed KEY, then improvised an answer from
+# `ls .cue/dev` and got the next step right by luck. The exit code was carrying
+# the whole verdict and nothing was carrying the way out.
+#
+# So the ordering lives in one place, as data, and every skill starts by asking.
+# What this cannot do is stop a user from typing a command — the commands are
+# always on the menu. What it can do is make the refusal deterministic and give
+# the controller a next action it did not have to invent.
+#
+# Usage: scripts/gate <stage> [KEY]
+#   stage: init | start | design | plan | implement | finish | status | redo
+#
+#   exit 0  the stage may run — `key` and `stage` name what it will run against
+#   exit 1  blocked — the `now` lines are the commands that are available instead
+#   exit 2  not a repository / usage error
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=plugins/cue-dev/skills/using-cue/scripts/common
+. "$SCRIPT_DIR/common"
+
+cue_log_load
+
+[ $# -ge 1 ] && [ $# -le 2 ] || {
+  echo "usage: scripts/gate <stage> [KEY]" >&2
+  exit 2
+}
+want=$1
+key=${2:-}
+
+case "$want" in
+  init|start|design|plan|implement|finish|status|redo) ;;
+  *) echo "unknown stage: '$want'" >&2; exit 2 ;;
+esac
+
+cue_repo_root >/dev/null || { echo "not a git repository" >&2; exit 2; }
+
+# --- the language line -------------------------------------------------------
+#
+# Printed on every answer this script gives, blocked or not, because every stage
+# skill runs it before doing anything and this is therefore the one line that
+# reaches all of them at the moment of use.
+#
+# It is in the config and the SessionStart hook already says so. It was not
+# enough, and the reason is structural rather than a lapse: the hook speaks once,
+# at the top of the session, and then a four-hundred-line skill written entirely in
+# English is loaded on top of it. In a repository set to `ko` a real session
+# conducted the whole of /cue-dev:init and /cue-dev:start in English, and the
+# design questions too, while writing design.md in Korean — because the only
+# sentence about language sat two-thirds of the way down design's skill body, in
+# the section about writing the file. The instruction arrived after the questions
+# were over, and it was scoped to a document rather than to speech.
+#
+# So it arrives here instead: in band, in the output being read, at the top of
+# every stage. It is spelled as an instruction because a bare `ko` was already
+# available and was already being read past.
+#
+# It goes to stderr, and that is the whole of what separates it from the answer.
+# Everything on stdout is addressed to the user — `blocked` is a fact
+# about their repository, `now` lines are commands they can type. This line is
+# addressed to the model reading the tool result, and it is the one line here that
+# is not about the repository at all. On one channel with the rest it was read as
+# part of the block to relay, and a real session pasted `language ko — reply to
+# the user in this language…` into its reply to that user, who had asked where
+# their work stood. Both channels reach the model; only one of them is the answer.
+say_language() {
+  printf '  %-10s%s\n' language \
+    "$(cue_language) — reply to the user in this language; the skill you are reading is English by convention, not by instruction" >&2
+}
+say_language
+
+blocked=""
+nows=()
+now() { nows+=("$1"); }
+
+report() {
+  printf '  %-10s%s\n' blocked "$blocked"
+  local n
+  # `${a[@]}` on an empty array is an unbound-variable error under `set -u` in
+  # bash before 4.4, which Git Bash still ships in places.
+  for n in ${nows[@]+"${nows[@]}"}; do
+    printf '  %-10s%s\n' now "$n"
+  done
+  exit 1
+}
+
+# --- Is the repository usable at all? ----------------------------------------
+# Ahead of everything, because a repository with no commits cannot produce a base
+# branch, and that only surfaces at finish when there is nowhere to open a PR.
+if ! git rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
+  blocked="the repository has no commits — cue-dev needs a base branch to exist"
+  now "make one commit first (a README is enough), then /cue-dev:init"
+  report
+fi
+
+if [ "$want" = init ]; then
+  printf '  %-10s%s\n' ok init
+  exit 0
+fi
+
+# --- start: needs a prepared repository, not an existing work item -----------
+if [ "$want" = start ]; then
+  if ! cue_config_validate >/dev/null; then
+    blocked="the config has problems, so the conventions cannot be read"
+    now "/cue-dev:init  — show the current settings and fix them"
+    report
+  fi
+  printf '  %-10s%s\n' ok start
+  exit 0
+fi
+
+# --- Everything else runs against one work item ------------------------------
+if [ -z "$key" ]; then
+  key=$(cue_key_from_branch) || key=""
+fi
+
+if [ -z "$key" ]; then
+  # No KEY on the branch and none given. This is the case that produced the
+  # useless refusal: the honest answer is not "pass a KEY", it is "nothing has
+  # been started here".
+  works=$(cue_works_dir)
+  existing=""
+  if [ -d "$works" ]; then
+    existing=$(find "$works" -mindepth 1 -maxdepth 1 -type d ! -name sdd 2>/dev/null \
+      | sed 's|.*/||' | sort | paste -sd' ' - || true)
+  fi
+  # The items are counted, never named.
+  #
+  # This used to list them, and the list was the bug. `.cue/dev/` is an archive —
+  # it accumulates on purpose, and finished records are kept deliberately — so
+  # naming its contents answers "what exists here", which is not the question. A
+  # real session read that list back to the user as "several items in progress",
+  # named four, and asked which one to continue. All four had merged.
+  #
+  # Splitting the list into open and landed was the first repair and it was the
+  # wrong one: it kept a list that should not exist and made it prettier. The
+  # question was never which item the user meant — no KEY was given, so there is
+  # no answer to guess at. `using-cue` said so from the start, at the one call site
+  # that runs with no KEY: "If it cannot find a KEY (you are not in cue-dev work),
+  # it simply fails and you move on."
+  #
+  # Branch inference stays, and it is not guessing: it reads the `branch:` line the
+  # item recorded in its own demand.md. What is refused here is the case where that
+  # recorded fact matches nothing.
+  #
+  # The fact first, the KEY second. This said "no KEY given, and no work item
+  # records this branch", which leads with a KEY the user has no reason to be
+  # holding — they ran a command with no arguments and got told an argument was
+  # missing. Nothing is in flight on this branch is the answer; naming an item is
+  # what they may do next, and that is what the `now` lines are for.
+  if [ -n "$existing" ]; then
+    blocked="nothing is in progress on this branch — no work item records it"
+    now "/cue-dev:status <KEY>  — name the item"
+    now "/cue-dev:start  — begin a new item"
+  else
+    blocked="no cue-dev work exists in this repository yet"
+    now "/cue-dev:start  — begin the first item"
+    [ -f "$(cue_repo_root)/.cue/dev/config" ] || \
+      now "/cue-dev:init  — settle the conventions first (optional; defaults work)"
+  fi
+  report
+fi
+
+cue_key_is_safe "$key" || { echo "not usable as a KEY: $key" >&2; exit 2; }
+
+work=$(cue_work_dir "$key")
+if [ ! -d "$work" ]; then
+  blocked="no records for '$key' (no $work)"
+  now "/cue-dev:start  — begin it"
+  report
+fi
+
+# The marker where there is one, the committed records where the marker that
+# should have been there is gone — the same resolution status uses, from the same
+# function, because a gate that disagrees with the status block the user is
+# looking at is worse than either answer alone. Reading markers only, this sent an
+# item whose records show a finished implementation back to /cue-dev:start.
+stage=$(cue_effective_stage "$key")
+lost=no
+cue_markers_lost "$key" && lost=yes
+
+# Each stage's precondition is the marker that must already be stamped, and the
+# command that stamps it. Keeping both in one table is the point — a precondition
+# with no way out is what the old refusals were.
+# `done_marker` is the marker this stage stamps when it finishes. Running a stage
+# that has already been stamped is the other half of the ordering, and it was
+# missing: the records are derived from one another, so rewriting design.md in
+# place leaves plan.md and the outcome rows describing a design that no longer
+# exists. That is the state redo's cascade exists to prevent, reached by walking
+# forwards instead of back — and with no backup branch, because nothing rewound.
+#
+# finish stamps nothing and is deliberately repeatable: it is where a run that
+# stopped half way is picked up.
+#
+# finish needs `outcome`, not `plan`. It could not before: the outcome marker was
+# stamped by finish itself, so requiring it would have blocked the stage that
+# stamps it. The marker moved to the end of implement — where the record it names
+# is actually complete — and this precondition is what makes that placement
+# enforced rather than hoped for. A skipped stamp now stops finish and names
+# implement, instead of leaving an item that merged with no marker at all.
+case "$want" in
+  design)    need=demand;  done_marker=design;  fix="/cue-dev:start  — capture the requirement first" ;;
+  plan)      need=design;  done_marker=plan;    fix="/cue-dev:design  — design it first" ;;
+  implement) need=plan;    done_marker=outcome; fix="/cue-dev:plan  — plan it first" ;;
+  finish)    need=outcome; done_marker="";      fix="/cue-dev:implement  — the result is not recorded yet" ;;
+  status)    need="";      done_marker="";      fix="" ;;
+  redo)      need=demand;  done_marker="";      fix="/cue-dev:start  — nothing has been stamped to rewind" ;;
+esac
+
+if [ -n "$need" ]; then
+  # The markers are ordered, so "at least" is a rank comparison rather than an
+  # equality test — implement may run when the last marker is plan, and finish may
+  # run when it is plan or outcome.
+  rank() {
+    case "$1" in
+      demand) printf '%s' 1 ;; design) printf '%s' 2 ;;
+      plan)   printf '%s' 3 ;; outcome) printf '%s' 4 ;;
+      *)      printf '%s' 0 ;;
+    esac
+  }
+  if [ "$(rank "$stage")" -lt "$(rank "$need")" ]; then
+    blocked="'$key' has not reached $need yet (last stamped: ${stage:-nothing})"
+    now "$fix"
+    report
+  fi
+fi
+
+# Already done. The way forward is a rewind, which is the only path that leaves a
+# backup branch and discards the records that were derived from this one.
+#
+# implement is the case worth being careful about: its marker is stamped at the
+# very end, after verify passes, so a run that stopped half way has no marker yet
+# and resumes here rather than being sent to redo. That is the whole point of the
+# rows — they carry the progress, the marker carries the completion.
+if [ -n "$done_marker" ] &&
+   { cue_marker_commit "$done_marker" "$key" >/dev/null 2>&1 ||
+     [ "$(cue_stage_rank "$stage")" -ge "$(cue_stage_rank "$done_marker")" ]; }; then
+  blocked="'$key' has already been through $want — doing it again in place would leave the later records describing something that no longer exists"
+  # With the markers gone there is nothing for redo to rewind to, so naming it
+  # would hand the controller a command that refuses. The records are the only
+  # evidence left and re-running the stage would overwrite them, which is the one
+  # outcome worth blocking hardest.
+  if [ "$lost" = yes ]; then
+    now "/cue-dev:status $key  — the markers are not in this history; the records are all that is left of this item"
+  else
+    now "/cue-dev:redo $want  — rewind first (it makes a backup branch)"
+    now "/cue-dev:status $key"
+  fi
+  report
+fi
+
+printf '  %-10s%s\n' ok "$want"
+printf '  %-10s%s\n' key "$key"
+printf '  %-10s%s\n' stage "${stage:-nothing stamped yet}"
+if [ "$lost" = yes ]; then
+  printf '  %-10s%s\n' history \
+    "⚠ read from the committed records — no cue-dev markers in this history"
+fi
+exit 0

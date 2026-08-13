@@ -1,0 +1,25 @@
+# Ensure shell scripts always have LF line endings.
+# The hook and skill scripts have no extension (Claude Code's Windows
+# auto-detection prepends bash when it sees .sh). They cannot be caught by
+# extension, so they are listed by path.
+*.sh text eol=lf
+plugins/*/hooks/session-start text eol=lf
+plugins/*/scripts/* text eol=lf
+plugins/*/skills/*/scripts/* text eol=lf
+
+# Ensure the polyglot wrapper keeps LF (it's parsed by both cmd and bash)
+*.cmd text eol=lf
+
+# Common text files
+*.md text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.ts text eol=lf
+
+# Explicitly mark binary files
+*.png binary
+*.jpg binary
+*.gif binary

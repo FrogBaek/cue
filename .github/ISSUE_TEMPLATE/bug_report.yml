@@ -1,0 +1,72 @@
+name: Bug report
+description: A stage did something other than what it says it does
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The two fields that resolve most reports fastest are the `status` output
+        and what you expected instead. Everything else is optional.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: The stage you ran, and what it did.
+      placeholder: |
+        Ran /cue-dev:finish. It merged without asking about the worktree.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+      description: >
+        If the skill or the docs say something different from what happened, quote
+        the line. That turns a report into a fix.
+    validations:
+      required: true
+
+  - type: textarea
+    id: status
+    attributes:
+      label: Status output
+      description: >
+        Run `/cue-dev:status <KEY>` and paste the box. It carries the stage, the
+        markers, the branch and the workspace — most of what a diagnosis needs.
+        Redact anything you would rather not publish; the shape still helps.
+      render: text
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: cue-dev version
+      description: From `.claude-plugin/marketplace.json`, or the commit you installed.
+      placeholder: "0.1.0"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - Other
+    validations:
+      required: false
+
+  - type: textarea
+    id: anything-else
+    attributes:
+      label: Anything else
+      description: >
+        Whether it reproduces, whether the repository has a remote, whether the
+        item was in a worktree — any of these can be the whole answer.
+    validations:
+      required: false

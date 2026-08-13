@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Resolve and ensure the working-tree directory SDD uses for one plan's
+# short-lived artifacts: task briefs, implementer reports and review packages.
+# Print the plan directory's absolute path.
+#
+# One directory per plan (.cue/dev/sdd/<KEY>/ for a cue-dev plan, otherwise
+# .cue/dev/sdd/<plan-basename>/) so a follow-up plan in the same working tree can
+# never read or overwrite another plan's artifacts. One plan's report misread as
+# another's makes controllers skip whole task sequences — this scoping removes
+# that failure structurally.
+#
+# The workspace lives in the working tree (not under .git/) because Claude Code
+# treats .git/ as a protected path and denies agent writes there — which blocks
+# an implementer subagent from writing its report file. A self-ignoring
+# .gitignore at .cue/dev/sdd/ keeps every plan's workspace out of
+# `git status` and out of accidental commits without modifying any tracked file.
+#
+# Single source of truth for the workspace location, so task-brief and
+# review-package cannot drift to different directories.
+#
+# Usage: sdd-workspace PLAN_FILE
+set -euo pipefail
+
+if [ $# -ne 1 ]; then
+  echo "usage: sdd-workspace PLAN_FILE" >&2
+  exit 2
+fi
+
+plan=$1
+[ -f "$plan" ] || { echo "no such plan file: $plan" >&2; exit 2; }
+
+slug=$(basename "$plan" .md)
+
+# Every cue-dev plan is called plan.md, so the basename is `plan` for all of them
+# and the per-plan scoping above was scoping nothing: two items in one checkout
+# both resolved to `.cue/dev/sdd/plan/`, where task-1-brief.md from the second
+# overwrites the first's. That is precisely the failure the directory split exists
+# to prevent, and the comment above described a property the code did not have.
+#
+# The KEY is the parent directory (`.cue/dev/<KEY>/plan.md`), so it is one call
+# away. Plans that are not called plan.md keep naming their own directory —
+# nothing outside cue-dev's own layout changes.
+if [ "$slug" = plan ]; then
+  parent=$(basename "$(cd "$(dirname "$plan")" && pwd)")
+  case "$parent" in
+    ''|.|..|/) ;;
+    *) slug=$parent ;;
+  esac
+fi
+
+[ -n "$slug" ] && [ "$slug" != "." ] && [ "$slug" != ".." ] \
+  || { echo "cannot derive a workspace name from: $plan" >&2; exit 2; }
+
+# Normalizes the root once into pwd form. On Git Bash, `git rev-parse
+# --show-toplevel` yields `C:/...` while `pwd` yields `/c/...`. Without aligning
+# them here, every consumer of this path (task-brief, review-package, the
+# controller) ends up with a different format, and path comparisons break on
+# Windows only.
+# This is the same convention as cue_repo_root in plugins/cue-dev/scripts/common.
+root=$(cd "$(git rev-parse --show-toplevel)" && pwd)
+base="$root/.cue/dev/sdd"
+dir="$base/$slug"
+mkdir -p "$dir"
+printf '*\n' > "$base/.gitignore"
+printf '%s\n' "$dir"

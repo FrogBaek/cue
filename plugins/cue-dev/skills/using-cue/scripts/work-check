@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# How strongly one work item's implementation is to be checked.
+#
+# This replaces `config --get min_check`. The check level used to be a
+# repository-wide floor, and it was the last value in the config that was not a
+# fact about the repository. It leaves for the same two reasons base_branch did,
+# one step further along.
+#
+# The first is parallelism. A colour change wants `self-review`; the migration
+# running in the worktree beside it wants `independent-review`. One value cannot
+# be both, so expressing the second meant rewriting a value the first still
+# depended on — and because worktrees each carry their own checked-out copy of the
+# config, the rewrite either missed the other session or, at merge time, reached
+# every session at once. Neither is a thing anyone asked for.
+#
+# The second is that a floor answers the wrong question. It said what may not
+# happen and never what should, so /cue-dev:implement had nothing to read and
+# decided per run, from the shape of the plan, whether to dispatch subagents. Two
+# runs of one item took different paths. Recorded here it is settled once, by the
+# person who knows how risky the item is, while they are already answering
+# questions about it in /cue-dev:start — and implement reads a value instead of
+# forming a judgement.
+#
+# So it is recorded in that item's demand.md header, beside the others:
+#
+#   <!-- check: independent-review -->
+#
+# Usage:
+#   work-check <KEY>             the level, resolved
+#   work-check <KEY> --source    where that answer came from
+#   work-check <KEY> --show      both, as notice lines
+#   work-check <KEY> --plan      what implement should do about it
+#   work-check --line <level>    the header line, for start to write
+#
+#   exit 0  answered
+#   exit 1  no such work
+#   exit 2  usage error / not a level / not a repository
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=plugins/cue-dev/skills/using-cue/scripts/common
+. "$SCRIPT_DIR/common"
+
+cue_repo_root >/dev/null || exit 2
+
+usage() {
+  # The Usage block, matched rather than numbered. A fixed range is a reference
+  # nothing checks: scripts/integration grew nine header lines and its usage()
+  # went on printing the four that used to be there, so a real session asking for
+  # a form it accepts was handed a paragraph out of a design note.
+  awk '/^# Usage:/ { on = 1 } on && !/^#/ { exit } on { sub(/^# ?/, ""); print }' "$0" >&2
+  exit 2
+}
+
+# --- the emitter -------------------------------------------------------------
+#
+# start writes demand.md itself, but not this line — the same argument as
+# scripts/work-base and scripts/marker. A string other scripts parse must have
+# exactly one author, or it drifts in the one repository that formatted it
+# differently, and the drift is silent: the file is written, the commit succeeds,
+# and only that item's check level becomes unreadable.
+if [ "${1:-}" = "--line" ]; then
+  shift
+  [ $# -eq 1 ] || usage
+  if ! problem=$(cue_validate_value check "$1"); then
+    echo "$problem" >&2
+    exit 2
+  fi
+  printf '<!-- check: %s -->\n' "$1"
+  exit 0
+fi
+
+[ $# -ge 1 ] && [ $# -le 2 ] || usage
+key=$1
+mode=${2:---level}
+
+cue_key_is_safe "$key" || { echo "not usable as a KEY: $key" >&2; exit 2; }
+work=$(cue_work_dir "$key")
+[ -d "$work" ] || { echo "work not found: $key (no $work)" >&2; exit 1; }
+
+level=$(cue_item_check_resolved "$key")
+source=$(cue_item_check_source "$key")
+
+# The skills directory, from this script's own location rather than from any
+# setting: scripts/ sits inside skills/using-cue/, so two levels up is it. The
+# session context names the same directory, but a path assembled from that by
+# hand is the one that comes back as `command not found`.
+skills=$(cd "$SCRIPT_DIR/../.." && pwd)
+
+case "$mode" in
+  --level)
+    printf '%s\n' "$level"
+    ;;
+  --source)
+    printf '%s\n' "$source"
+    ;;
+  --show)
+    printf '  %-10s%s\n' check "$level"
+    printf '  %-10s%s\n' from "$source"
+    ;;
+  --plan)
+    # The whole reason this is a script and not a lookup. implement used to read a
+    # floor and then decide for itself what to do about it, which is the step that
+    # made two runs of one item diverge. Here the level names the method, in one
+    # place, and implement executes rather than judges.
+    #
+    # Both paths carry the same six invariants. What differs is who reads the diff
+    # — and that is exactly what checked-by records, so the record and the method
+    # cannot drift apart.
+    #
+    # The `procedure` line is the reason a path is printed rather than described.
+    # implement's SKILL.md used to carry both methods — one as a table cell
+    # pointing at a linked file, the other written out in full — and a run whose
+    # item said independent-review followed the one that was written out. It never
+    # opened the link. The two methods are separate documents now, and this line
+    # is what says which one is yours, in output the caller has already read.
+    printf '  %-10s%s\n' check "$level"
+    printf '  %-10s%s\n' from "$source"
+    case "$level" in
+      independent-review)
+        printf '  %-10s%s\n' method "dispatch a subagent implementer per task, then a reviewer that did not write it"
+        printf '  %-10s%s\n' procedure "$skills/implement/independent-review.md"
+        printf '  %-10s%s\n' now "read that file now — implement's SKILL.md does not contain this method"
+        printf '  %-10s%s\n' record "checked-by: independent-review"
+        printf '  %-10s%s\n' 'if it fails' "a dispatch that cannot be made drops to self-review — record what happened, do not record what was asked for"
+        ;;
+      self-review)
+        printf '  %-10s%s\n' method "implement in this session, task by task, and read each task's own diff before recording it"
+        printf '  %-10s%s\n' procedure "$skills/implement/self-review.md"
+        printf '  %-10s%s\n' now "read that file now — implement's SKILL.md does not contain this method"
+        printf '  %-10s%s\n' record "checked-by: self-review"
+        printf '  %-10s%s\n' note "the invariants do not move — every task still tests, commits and records its row"
+        ;;
+      *)
+        printf '  %-10s%s\n' method "unreadable level '$level'"
+        printf '  %-10s%s\n' now "fix the header line: work-check --line <independent-review|self-review>"
+        exit 2
+        ;;
+    esac
+    ;;
+  *) usage ;;
+esac

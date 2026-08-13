@@ -1,0 +1,1374 @@
+#!/usr/bin/env bash
+# Shared helpers. Sourced by scripts/status and scripts/redo.
+#
+# cue-dev's stage detection rests on one thing: the commit marker. With no state
+# machine and no record.yaml, the commit subject `cue-dev(<stage>): <KEY>` alone
+# decides both "how far did we get" and "where do we rewind to". So the moment the
+# marker lookup is duplicated across the two scripts, the two drift apart. This is
+# the single source of truth.
+#
+# The KEY is the identifier the developer knows, and cue-dev does not validate its
+# format. Nor does it require anything of a branch name: each item records the
+# branch it was cut onto in its own demand.md, and cue_key_from_branch reads that
+# back. Nothing here infers one identifier from the other, which is what keeps us
+# from forcing a branch naming convention on anyone.
+
+# shellcheck shell=bash
+
+CUE_STAGES="demand design plan outcome"
+
+# Returns the root normalized once through pwd. On Git Bash, `git rev-parse
+# --show-toplevel` yields `C:/...` while `pwd` yields `/c/...`. Mix the two formats
+# and path comparisons break on Windows only (this is what made
+# tests/cue-dev/test-sdd-workspace.sh fail). We match the `cd && pwd` form the
+# skill scripts use.
+#
+# Asked once per process. A single status run calls this more than 20 times, and at
+# a `git rev-parse` plus a subshell each, that alone costs over a second (fork cost
+# on Windows). The scripts never cd while running, so the answer cannot change.
+cue_repo_root() {
+  if [ -n "${CUE_REPO_ROOT:-}" ]; then
+    printf '%s\n' "$CUE_REPO_ROOT"
+    return 0
+  fi
+  local root
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || {
+    echo "not a git repository" >&2
+    return 2
+  }
+  CUE_REPO_ROOT=$(cd "$root" && pwd)
+  printf '%s\n' "$CUE_REPO_ROOT"
+}
+
+cue_works_dir() {
+  printf '%s/.cue/dev' "$(cue_repo_root)"
+}
+
+# Where the settings file is — the main checkout's copy, always.
+#
+# Not `cue_repo_root`, and the difference is the whole point. A worktree carries
+# its own checked-out `.cue/dev/config`, so reading it from the local root gives
+# every parallel item its own private copy of the repository's conventions. Two
+# things went wrong with that, and both are silent. `/cue-dev:init` run inside one
+# worktree changed the marker prefix for that item alone, and the item beside it
+# went on stamping the old one — two vocabularies in one history, with nothing
+# saying so until a marker lookup came up empty. And when that worktree merged,
+# its config landed on the base branch and became everyone's, without anyone
+# having been asked.
+#
+# Conventions are repository scope by definition — that is the rule deciding what
+# may live in this file at all (see scripts/config). A repository-scoped value read
+# from a branch-scoped file was never going to hold. Everything that genuinely
+# varies per item is recorded in that item's demand.md header instead: the start
+# point, the branch, the worktree, and now the check level.
+#
+# The main root is the same directory for every worktree of one repository, so a
+# change made anywhere is seen everywhere at once, which is what "the repository
+# uses this convention" has to mean.
+cue_config_file() {
+  if [ -n "${CUE_CONFIG_FILE:-}" ]; then
+    printf '%s\n' "$CUE_CONFIG_FILE"
+    return 0
+  fi
+  local root
+  # Falls back to the local root rather than failing: `git rev-parse
+  # --git-common-dir` needs a repository, and the callers that reach here without
+  # one are already on their way to a clearer error than this one would be.
+  root=$(cue_main_root 2>/dev/null) || root=$(cue_repo_root 2>/dev/null) || return 1
+  CUE_CONFIG_FILE="$root/.cue/dev/config"
+  printf '%s\n' "$CUE_CONFIG_FILE"
+}
+
+# --- Convention settings -----------------------------------------------------
+#
+# Commit markers and branch names are traces cue-dev leaves in the *user's* shared
+# space. The git history and the branch list belong to the whole team and already
+# have conventions of their own, so they must not be stamped without asking. The
+# layout inside .cue/dev/ is read and written by cue-dev alone, so it is not
+# configurable.
+#
+# With no settings file everything is the default — that is, it runs as is with no
+# configuration at all.
+
+# Reads the settings file once per process into CUE_CFG_<key>.
+#
+# This replaced sweeping the file with sed on every lookup. One read spawned four
+# processes (sed, head, tr, sed), and a function that merely read one setting
+# accounted for half of status's runtime. With shell builtins only, it spawns none.
+#
+# Comment lines (starting with `#`) and lines whose key holds invalid characters
+# are skipped. If a key appears twice, the first line wins — the same rule as
+# sed | head -1.
+cue_config_load() {
+  [ -n "${CUE_CONFIG_LOADED:-}" ] && return 0
+  CUE_CONFIG_LOADED=1
+
+  local file line key val
+  file=$(cue_config_file 2>/dev/null) || return 0
+  [ -f "$file" ] || return 0
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}                      # edited on Windows, it carries a CR
+    case "$line" in *'='*) ;; *) continue ;; esac
+    key=${line%%=*}
+    val=${line#*=}
+    key=${key#"${key%%[![:space:]]*}"}      # strip surrounding whitespace
+    key=${key%"${key##*[![:space:]]}"}
+    case "$key" in ''|*[![:lower:]_]*) continue ;; esac
+    val=${val#"${val%%[![:space:]]*}"}
+    val=${val%"${val##*[![:space:]]}"}
+    eval "[ -n \"\${CUE_CFG_${key}+x}\" ] || CUE_CFG_${key}=\$val"
+  done < "$file"
+}
+
+cue_config_get() {
+  local key=$1 default=$2 val
+  cue_config_load
+  case "$key" in ''|*[![:lower:]_]*) printf '%s' "$default"; return 0 ;; esac
+  eval "val=\${CUE_CFG_${key}-}"
+  [ -n "$val" ] && printf '%s' "$val" || printf '%s' "$default"
+}
+
+# For when the settings file changed and must be re-read (scripts/config --set).
+cue_config_invalidate() {
+  local key
+  for key in $(set | sed -n 's/^\(CUE_CFG_[a-z_]*\)=.*/\1/p'); do
+    unset "$key"
+  done
+  unset CUE_CONFIG_LOADED
+  unset CUE_CONFIG_FILE
+}
+
+cue_marker_prefix() { cue_config_get marker_prefix "cue-dev"; }
+
+# Every marker prefix this repository has ever used — the current one first.
+#
+# Change the prefix and there is no way left to find the old markers, so all
+# earlier work becomes invisible. That is why a change records the old prefix in
+# marker_prefix_history and lookups sweep this whole list. New commits get the new
+# prefix while past history stays readable.
+#
+# Branch names get no such mechanism and need none. They are visible through
+# `git branch` and recorded per item besides, whereas markers are buried in the
+# history — not finding one is the same as it not existing.
+cue_marker_prefixes() {
+  local cur hist
+  cur=$(cue_marker_prefix)
+  hist=$(cue_config_get marker_prefix_history "")
+  printf '%s' "$cur"
+  [ -n "$hist" ] && printf ' %s' "$hist"
+  printf '\n'
+}
+
+# There is no branch_prefix here any more, and nothing reads one.
+#
+# It failed the same way base_branch did, one item later: git flow names a feature
+# branch `feature/` and a hotfix `hotfix/`, and one repository-wide value cannot be
+# both. The cost was lighter — a wrong suggestion, not a wrong merge — but a
+# setting nothing may safely read is a setting that should not exist.
+#
+# What replaced it is not another prefix. The work branch is named by whoever
+# starts the work, in whatever convention the team already uses, and its full name
+# is recorded in that item's demand.md — see cue_item_branch below. The name is
+# read back from git after the branch exists, so native worktree tooling that
+# renames it (`cue-dev/I18N` came back as `worktree-cue-dev+I18N`) records what it
+# actually made rather than tripping a warning.
+
+# There is no base_branch here any more, and nothing reads one.
+#
+# It held two jobs first ("where work starts" and "where it lands"), which made a
+# git-flow hotfix inexpressible; splitting that off left it meaning the start
+# point alone. But the start point is not a property of the repository either — it
+# is a property of the ticket. A hotfix comes off main, the next feature off
+# develop, and one repository-wide value cannot be both, so expressing the second
+# item meant rewriting a setting the first item still depended on.
+#
+# It is settled per work item by /cue-dev:start and recorded in that item's
+# demand.md — see cue_item_base_ref below, and docs/branching-model.md.
+
+# Where work is pushed. Also one job — the pull-request target is not this value.
+# In a fork the two differ (push to your own fork, propose against the original),
+# and the PR target is already carried by the work item's start point, which may
+# name a remote-tracking ref such as `upstream/main`.
+cue_remote()        { cue_config_get remote ""; }
+
+# How a change request is opened in this repository — and nothing else.
+#
+# Merging into the landing branch is deliberately *not* an adapter concern: it is
+# plain git, it needs no forge, and it is available wherever a landing branch was
+# settled. What differs between repositories is only how work is proposed to
+# somebody: `gh` opens it, or a URL does, or it happens on a route cue-dev does
+# not drive at all.
+#
+#   github  gh opens the pull request, and can also say whether it merged
+#   git     a remote exists; the branch is pushed and the request is opened
+#           outside cue-dev — by the URL the push prints, or by hand
+#   none    no change-request path from here
+#
+# This is normally observed rather than stored (see cue_integration_observed). It
+# is a setting because observation can be wrong in one specific way: a repository
+# whose requests go somewhere other than the remote it pushes to — a GitHub mirror
+# of a Gerrit project, a team that takes patches by mail. Observation cannot see
+# that, and nothing else in the repository says it.
+cue_integration() {
+  local v
+  v=$(cue_config_get integration "")
+  [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+  cue_integration_observed
+}
+
+# What the repository looks like, with no config consulted.
+#
+# Deliberately conservative: `github` is claimed only when both halves are true —
+# the remote really is github.com *and* `gh` is actually on PATH. Claiming it on
+# the URL alone would put a pull-request option in the menu that dies on the
+# command that opens it, one step after the user chose it.
+cue_integration_observed() {
+  local remote url
+  remote=$(cue_remote)
+  if [ -z "$remote" ]; then
+    remote=$(git remote 2>/dev/null | head -1)
+  fi
+  [ -n "$remote" ] || { printf 'none'; return 0; }
+  url=$(git remote get-url "$remote" 2>/dev/null) || { printf 'none'; return 0; }
+  case "$url" in
+    *github.com[:/]*)
+      command -v gh >/dev/null 2>&1 && { printf 'github'; return 0; } ;;
+  esac
+  printf 'git'
+}
+
+# Resolves a start point to a ref that exists, and prints it in its short form
+# (`develop`, `origin/develop`, `upstream/main`).
+#
+# A base branch is routinely absent locally. Clone a git-flow repository and you
+# get `main` and nothing else — `develop` lives only as `origin/develop`, so a
+# plain existence check rejected the very value the user had to enter. Requiring
+# them to type `origin/develop` would then leak the remote into a field that is
+# about the branch.
+#
+# The order is: a local branch, then the configured remote, then any remote in
+# git's order, then the value as given (which is what accepts `upstream/main`).
+# Every caller resolves through here — init-check when it lists candidates,
+# work-base --line when it records one, work-base <KEY> when it reads one back —
+# so a name init-check offers cannot be one that start then fails to find.
+#
+# The name is always an argument. There is no repository-wide value to fall back
+# on when it is absent, and an empty argument is a caller that has not settled the
+# question yet.
+cue_resolve_base() {
+  local base=${1:-} remote r
+  [ -n "$base" ] || return 1
+
+  if git rev-parse --verify --quiet "refs/heads/$base" >/dev/null 2>&1; then
+    printf '%s' "$base"
+    return 0
+  fi
+  remote=$(cue_remote)
+  if [ -n "$remote" ] \
+     && git rev-parse --verify --quiet "refs/remotes/$remote/$base" >/dev/null 2>&1; then
+    printf '%s/%s' "$remote" "$base"
+    return 0
+  fi
+  for r in $(git remote 2>/dev/null); do
+    if git rev-parse --verify --quiet "refs/remotes/$r/$base" >/dev/null 2>&1; then
+      printf '%s/%s' "$r" "$base"
+      return 0
+    fi
+  done
+  if git rev-parse --verify --quiet "$base^{commit}" >/dev/null 2>&1; then
+    printf '%s' "$base"
+    return 0
+  fi
+  return 1
+}
+
+# --- The start point of one work item ----------------------------------------
+#
+# Where this item was cut from, and where it was cut. /cue-dev:start settles it
+# per item and writes it into that item's demand.md header:
+#
+#   <!-- base: develop @ 4f311b5 -->
+#
+# It is recorded rather than configured because the answer belongs to the ticket,
+# not to the repository — see the note where base_branch used to be. It is recorded
+# rather than left to be observed because "which branch did this come off" has no
+# single answer once the branch has been made: `git branch --contains` names every
+# branch that reached that commit, and the base itself moves on afterwards. The
+# one moment the answer is unambiguous is the moment start cuts the branch, so
+# that is where it is written down.
+
+# One named field out of an item's demand.md header, or nothing.
+#
+# Reads the header only. demand.md's body is a quotation of the requirement and is
+# never parsed — a `<!-- base: ... -->` sitting inside a pasted ticket must not be
+# mistaken for the record, or the text of a ticket would decide where the work
+# merges. The header ends at the first line that is neither a comment nor blank,
+# which is the `# <KEY> — <title>` heading.
+_cue_parse_header_field() {
+  local field=$1 line
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}                      # written on Windows, it carries a CR
+    case "$line" in
+      '')      continue ;;
+      '<!--'*) ;;
+      *)       return 1 ;;                  # past the header
+    esac
+    case "$line" in
+      *"$field:"*)
+        line=${line#*"$field:"}
+        line=${line%%-->*}
+        line=${line#"${line%%[![:space:]]*}"}
+        line=${line%"${line##*[![:space:]]}"}
+        [ -n "$line" ] || return 1
+        printf '%s' "$line"
+        return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# This item's demand.md on stdout, from wherever this repository still has it.
+#
+# Three sources, in order of directness: the checkout you are standing in, the
+# main checkout, and the item's own branch. Before there was more than the first
+# one, every lookup about an item silently meant "…as visible from wherever the
+# shell happens to be" — and that is not what a record is for.
+#
+# The cost of the single source was a whole finish run. It runs in the main
+# checkout by design, and an item that has not merged yet has no `.cue/dev/<KEY>/`
+# there: its record is committed on its own branch and nowhere else. So every
+# question about the item came back empty, finish-cleanup read the emptiness as
+# "this item has no worktree", exited 0 having removed nothing, and the notice
+# reported a settled workspace over a second full checkout still on disk. Two
+# steps later `git branch -d` refused, and the removal was finished by hand,
+# outside every guard cue-dev has.
+#
+# The record file is an argument, defaulting to demand.md. Every early caller
+# wanted the header fields, so the name was baked in — and then finish needed
+# design.md from the main checkout, where an unmerged item has no working copy of
+# that either. The three sources are the same three; only the file name differed.
+_cue_item_record() {
+  local key=$1 name=${2:-demand.md} file ref blob
+  [ -n "$key" ] || return 1
+
+  file="$(cue_work_dir "$key")/$name"
+  [ -f "$file" ] && { cat "$file"; return 0; }
+
+  file="$(cue_main_root 2>/dev/null)/.cue/dev/$key/$name"
+  [ -f "$file" ] && { cat "$file"; return 0; }
+
+  ref=$(cue_item_record_ref "$key" "$name") || return 1
+  blob=$(_cue_record_blob "$ref" "$key" "$name") || return 1
+  git -C "$(cue_repo_root)" cat-file blob "$blob" 2>/dev/null
+}
+
+_cue_item_header_field() {
+  local key=$1 field=$2
+  [ -n "$key" ] || return 1
+  _cue_item_record "$key" | _cue_parse_header_field "$field"
+}
+
+# The blob id of this item's demand.md in one ref's tree, or nothing.
+#
+# `git ls-tree <ref> -- <path>`, and never the `<ref>:<path>` form. On Git Bash
+# the colon form is mangled before git ever sees it — MSYS reads `a:b` as a path
+# list and hands git `refs\heads\x;.cue\dev\...`, which dies as `Not a valid
+# object name`. It fails on Windows only, which is the shape of defect this
+# plugin has now paid for several times.
+_cue_record_blob() {
+  git -C "$(cue_repo_root)" ls-tree "$1" -- ".cue/dev/$2/${3:-demand.md}" 2>/dev/null \
+    | awk '$2 == "blob" { print $3; found = 1 } END { exit !found }'
+}
+
+# A local ref whose tree carries this item's demand.md, or nothing.
+#
+# Local heads only: a remote-tracking copy would answer for work that is not in
+# this repository's reach, and there is nothing on disk here for it to describe.
+cue_item_record_ref() {
+  local key=$1 name=${2:-demand.md} root ref
+  [ -n "$key" ] || return 1
+  root=$(cue_repo_root) || return 1
+  while IFS= read -r ref; do
+    [ -n "$ref" ] || continue
+    if _cue_record_blob "$ref" "$key" "$name" >/dev/null; then
+      printf '%s' "$ref"
+      return 0
+    fi
+  done < <(git -C "$root" for-each-ref --format='%(refname)' refs/heads 2>/dev/null)
+  return 1
+}
+
+# Whether this repository has a record for this item at all.
+#
+# The question finish-cleanup has to ask before it may answer anything else.
+# "There is no record" and "the record says there is no worktree" are opposite
+# situations: one is a gap and one is a fact, and only the second is a licence to
+# report the workspace settled.
+cue_item_record_exists() {
+  _cue_item_record "$1" >/dev/null 2>&1
+}
+
+# The raw `<ref> @ <sha>` as recorded, or nothing.
+cue_item_base_line() { _cue_item_header_field "$1" base; }
+
+# The branch this item's work was cut onto, exactly as git reported it once the
+# branch existed.
+#
+# cue-dev requires nothing of this name. It used to require one thing — that the
+# KEY appeared somewhere in it — because the branch name was the only place the
+# KEY was written down, and cue_key_from_branch recovered it by substring match.
+# That made a team's own branch convention into cue-dev's business and surfaced as
+# a warning at the end of start, after the name had been chosen. Recording the
+# name removes the requirement instead of relaxing it.
+cue_item_branch() { _cue_item_header_field "$1" branch; }
+
+# --- How strongly this item's implementation is checked ----------------------
+#
+#   <!-- check: independent-review -->
+#
+# This used to be `min_check` in .cue/dev/config, and it was the last
+# repository-wide value that was not a repository-wide fact. It followed
+# base_branch out for the same reason, one step further along: a floor cannot be
+# both `self-review` for the colour change and `independent-review` for the
+# migration, and when it lived in config, expressing the second meant rewriting a
+# value the first still depended on — across parallel worktrees that shared the
+# one file, so the rewrite reached items nobody was looking at.
+#
+# The deeper problem was that it was a floor at all. A floor says what may not
+# happen; it never said what *should*, so /cue-dev:implement had no answer to
+# "dispatch subagents, or do this in session?" and decided per run from the shape
+# of the plan. Two runs of the same item took different paths. Recorded here, it is
+# settled once, by the person who knows how risky the item is, at the moment they
+# are already answering questions about it — and implement reads a value instead
+# of forming a judgement.
+#
+#   independent-review  something that did not write the code reads its diff
+#   self-review         the context that wrote it checks it
+#
+# `none` is not settable here for the same reason no floor could be `none`: it is
+# a thing that can *happen* to an item and be recorded in outcome.md's checked-by,
+# where it stops finish once. It is not a thing to plan. The two levels are
+# enumerated in cue_validate_value's `check` case, which is the one place that has
+# to judge a candidate value.
+
+cue_item_check() { _cue_item_header_field "$1" check; }
+
+# The item's check level, and separately where that answer came from.
+#
+# Items started before this field existed have no `check:` line, and the order
+# below is the point: a leftover `min_check` in config is honoured — that
+# repository did choose it, once — before the default. Upgrading the plugin must
+# not silently raise the bar under work already in flight.
+#
+# The two functions agree by construction because the second is written as the
+# same cascade; keeping the source out of the value is what lets every caller that
+# only wants the level ignore it. verify and work-check are the two that say it
+# out loud, and both must, because "this came from a setting we are retiring" is
+# the one thing a reader cannot see in the value itself.
+cue_item_check_resolved() {
+  local key=$1 v
+  v=$(cue_item_check "$key" 2>/dev/null) && [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+  v=$(cue_config_get min_check "")
+  [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+  printf '%s' independent-review
+}
+
+cue_item_check_source() {
+  local key=$1 v
+  v=$(cue_item_check "$key" 2>/dev/null) && [ -n "$v" ] && { printf 'demand.md header'; return 0; }
+  [ -n "$(cue_config_get min_check "")" ] && { printf 'legacy min_check in .cue/dev/config'; return 0; }
+  printf 'default — nothing recorded for this item'
+}
+
+# The worktree this item was built in, as an absolute path, or nothing.
+#
+# The third fact to move out of the conversation and into the record, after the
+# start point (7th) and the branch name (8th). It failed the same way both of them
+# did. cue_isolation_kind below answers "am I in a worktree right now"; nothing
+# answered "where is this item's worktree", so the only copy of that path lived in
+# whatever the session happened to remember. A real session invented
+# `.cue/worktrees/<KEY>` — a location named nowhere in this plugin — and every
+# later judgment about who owned it and how to remove it was made against a path
+# no rule described.
+#
+# Absent is a real answer, not a gap to fill: an item the user chose to build in
+# the main checkout has no worktree, and inventing one for it would be worse than
+# saying so.
+cue_item_worktree() { _cue_item_header_field "$1" worktree; }
+
+# The main checkout's root, from anywhere — including from inside a worktree,
+# where cue_repo_root answers with the worktree's own root instead.
+#
+# Worktrees hang off the main checkout, so every path built for one has to be
+# anchored here. finish-cleanup worked this out inline; it is a fact two callers
+# now need and only one of them should be allowed to spell.
+cue_main_root() {
+  local common
+  common=$(git rev-parse --git-common-dir 2>/dev/null) || { echo "not a git repository" >&2; return 2; }
+  (cd "$common/.." 2>/dev/null && pwd -P) || { echo "not a git repository" >&2; return 2; }
+}
+
+# Where a worktree for this KEY goes. One expression, so the model never picks.
+#
+# `.worktrees/` under the main checkout, hidden, matching what
+# using-git-worktrees has always documented as the default. The KEY names it
+# because the KEY is the one identifier that is unique per item and safe on the
+# filesystem — a branch name is neither (slashes) and a title is neither.
+#
+# A real session put a worktree at `.cue/worktrees/<KEY>`, a path this plugin
+# names nowhere, and that one invention is what made it unownable at cleanup
+# time. The fix is not a firmer instruction; it is having nothing left to invent.
+cue_worktree_path() {
+  local root
+  root=$(cue_main_root) || return 2
+  printf '%s/.worktrees/%s\n' "$root" "$1"
+}
+
+# The ref it was cut from, resolved to one that exists.
+#
+# There is no fallback. An item with no recorded start point is one /cue-dev:start
+# never settled, and the honest answer is to say so: a repository-wide default
+# standing in here would be the last ticket's answer applied to this one, silently,
+# and the wrongness of it would not surface until the merge.
+cue_item_base_ref() {
+  local key=$1 line ref
+  line=$(cue_item_base_line "$key" 2>/dev/null || true)
+  ref=${line%%@*}
+  ref=${ref%"${ref##*[![:space:]]}"}
+  [ -n "$ref" ] || return 1
+  cue_resolve_base "$ref"
+}
+
+# The commit it was cut at. Fails when the recorded line carries no `@ <sha>`, or
+# names a commit this checkout does not have.
+cue_item_base_sha() {
+  local key=$1 line sha
+  line=$(cue_item_base_line "$key" 2>/dev/null || true)
+  case "$line" in *@*) ;; *) return 1 ;; esac
+  sha=${line#*@}
+  sha=${sha#"${sha%%[![:space:]]*}"}
+  sha=${sha%"${sha##*[![:space:]]}"}
+  [ -n "$sha" ] || return 1
+  git rev-parse --verify --quiet "$sha^{commit}" >/dev/null 2>&1 || return 1
+  printf '%s' "$sha"
+}
+
+# The language of the records and the conversation. Always a concrete two-letter
+# code — `en` unless the repository says otherwise.
+#
+# There used to be an `auto` value meaning "not decided", on which the hook
+# injected nothing and Claude was left to follow the conversation. That worked
+# while the skills were written in Korean and stopped working the moment they were
+# translated: with every skill body and every script line in English, the only
+# language signal Claude has is English, so `auto` silently meant "English" for a
+# user typing Korean. A default that lies is worse than a default that is merely
+# wrong, so the value is now always stated and always injected.
+#
+# It is not inferred from `$LANG`. In the environment this was built on (Windows
+# Git Bash) that variable is empty, so the inference is simply wrong.
+#
+# The shell scripts' own output never consults this value — scripts are fixed to
+# English. What this decides is the prose Claude produces (the conversation, and
+# the narrative in design.md and outcome.md), and it reaches Claude through exactly
+# two paths: the SessionStart hook and implement's subagent dispatches.
+cue_language()      { cue_config_get language "en"; }
+
+# --- Display frame -----------------------------------------------------------
+#
+# status and redo are the two outputs a user reads directly, so they share one
+# grammar with the completion notices the stage skills render: a titled rule, a
+# blank line between groups, and a label column the eye can run down. Anything
+# printed here is `label + value` — never a sentence.
+#
+# The whole convention, including what is deliberately left outside the block, is
+# written down in docs/output-format.md. Read it before adding a line.
+#
+# The rule is built by looping rather than by slicing a string. `━` is multi-byte
+# and both ${#var} and ${var:0:n} count bytes when the locale is empty, which it is
+# on Git Bash — slicing would cut a character in half.
+CUE_WIDTH=47
+
+# With no argument this closes the box that cue_head opened, at whatever width the
+# title forced it to. A KEY is not length-limited (cue_key_is_safe only rejects
+# characters, never length), so a long one pushes the header past CUE_WIDTH — and a
+# closing rule fixed at 47 would then sit visibly short of it.
+#
+# The default is resolved with a test rather than `${1:-${CUE_HEAD_WIDTH:-$CUE_WIDTH}}`.
+# One default nested inside another breaks on bash 3.2, which is what macOS ships:
+# the expansion runs past its own closing brace and takes the following assignment
+# with it, so `s` is never set and the next line dies under `set -u` with
+# `s: unbound variable`. Seven macOS suites failed on this one line, and moving the
+# assignment onto a line of its own did not help — the parser reaches across lines.
+# tests/cue-dev/test-shell-portability.sh holds the shell to this.
+cue_rule() {
+  local n s
+  n=${1:-}
+  [ -n "$n" ] || n=${CUE_HEAD_WIDTH:-$CUE_WIDTH}
+  s=''
+  # `${s}` braced, because the character after it is multi-byte. Written `"$s━"`,
+  # bash 3.2 on macOS reads the leading byte of `━` as part of the variable name
+  # and looks up `s━`, which is unset — reported as `s━: unbound variable`, a
+  # message whose own non-ASCII byte is invisible in most terminals and logs. It
+  # was read as a complaint about `s`, and two rounds of CI went into the wrong
+  # explanation. tools/lint-shell.sh now refuses the unbraced form.
+  while [ "$n" -gt 0 ]; do s="${s}━"; n=$((n - 1)); done
+  printf '%s\n' "$s"
+}
+
+# How many characters wide a string prints. `${#var}` counts *bytes* whenever the
+# locale is empty, which it is on Git Bash, so a title carrying `·` measured one
+# column too wide and the box closed short. Stripping UTF-8 continuation bytes
+# (0x80-0xBF) leaves exactly one byte per character.
+cue_display_width() {
+  printf '%s' "$1" | LC_ALL=C tr -d '\200-\277' | wc -c | tr -d ' '
+}
+
+# `━━━ <title> ━━━━━…`. The title is `<what just happened> · <KEY>`, matching the
+# completion notices the stage skills render.
+cue_head() {
+  local title=$1 w n
+  w=$(cue_display_width "$title")
+  n=$(( CUE_WIDTH - 5 - w ))
+  [ "$n" -lt 3 ] && n=3
+  CUE_HEAD_WIDTH=$(( 4 + w + 1 + n ))
+  printf '━━━ %s %s\n' "$title" "$(cue_rule "$n")"
+}
+
+# The namespace cue-dev keeps its own backup branches in.
+#
+# This one is genuinely repository-wide: cue-dev creates these branches and finds
+# them again by globbing the prefix, so it has to be the same value across the
+# whole repository and stable over time. Change it and every existing backup goes
+# missing — the same property that gives marker_prefix its history list, which is
+# why init does not offer to change it.
+#
+# It used to derive from branch_prefix. That parent is gone, and inheriting a
+# namespace from a value the user now picks per work item would have made every
+# item's backups land somewhere else.
+cue_backup_prefix() { cue_config_get backup_prefix "cue-dev/backup/"; }
+
+# The single source of truth for the marker string. Neither skills nor scripts
+# assemble it themselves.
+cue_marker() {
+  printf '%s(%s): %s' "$(cue_marker_prefix)" "$1" "$2"
+}
+
+# Validates the settings. Prints one line per problem to stdout and returns 1 if
+# there is any.
+#
+# Validating only in init is not enough — config is an ordinary committed text file
+# that people edit by hand at any time. A bad marker_prefix fails silently: the
+# commit succeeds and only that stage becomes invisible forever. So the reading
+# side checks too.
+# Checks a single value. On a problem it prints the reason and returns 1.
+# It takes the value as an argument so that --set can check a candidate *before*
+# writing it.
+cue_validate_value() {
+  local key=$1 val=$2
+  case "$key" in
+    marker_prefix)
+      case "$val" in
+        '') echo "marker_prefix is empty" ;;
+        *'('*|*')'*|*':'*)
+          echo "marker_prefix cannot contain parentheses or a colon: '$val' (it breaks the marker syntax <prefix>(<stage>): <KEY>)" ;;
+        *' '*) echo "marker_prefix cannot contain spaces: '$val'" ;;
+        *) return 0 ;;
+      esac
+      return 1 ;;
+    backup_prefix)
+      case "$val" in
+        '') echo "backup_prefix is empty — cue-dev would create backup branches at the top level"; return 1 ;;
+      esac
+      git check-ref-format --branch "${val}cue-dev-probe" >/dev/null 2>&1 && return 0
+      echo "backup_prefix does not produce a valid branch name: '$val'"
+      return 1 ;;
+    base_branch)
+      # Refused on the way in, not merely ignored. A repository that still holds
+      # this line keeps working — nothing reads it — but writing a *new* one is
+      # someone reaching for the setting that no longer decides anything, and a
+      # silent success there is a start point that never takes effect.
+      echo "base_branch is no longer a setting — the start point belongs to the work item, not the repository"
+      echo "/cue-dev:start settles it per item and records it in .cue/dev/<KEY>/demand.md"
+      return 1 ;;
+    branch_prefix)
+      # Same refusal, one step later in the same argument. The work branch is
+      # named per item — git flow calls a feature `feature/` and a hotfix
+      # `hotfix/`, so a repository-wide prefix cannot describe the second item
+      # without being rewritten under the first.
+      echo "branch_prefix is no longer a setting — the work branch is named per item and recorded"
+      echo "/cue-dev:start settles it and records it in .cue/dev/<KEY>/demand.md (scripts/work-branch)"
+      echo "cue-dev's own backup branches are namespaced by backup_prefix, which is still a setting"
+      return 1 ;;
+    remote)
+      [ -z "$val" ] && return 0
+      git remote get-url "$val" >/dev/null 2>&1 && return 0
+      echo "remote does not exist: '$val'"
+      return 1 ;;
+    language)
+      # `[[:lower:]]`, not `[a-z]`. A range is resolved by the locale's collation
+      # order, and macOS's default locale interleaves the cases — `K` sorts inside
+      # `a-z` there, so `language=KO` was accepted on macOS and rejected
+      # everywhere else. A character class is not collated.
+      case "$val" in
+        auto) echo "language no longer accepts 'auto' — state a two-letter code (en, ko, ...)"; return 1 ;;
+        [[:lower:]][[:lower:]]) return 0 ;;
+      esac
+      echo "language must be a two-letter language code: '$val'"
+      return 1 ;;
+    integration)
+      # Empty is legal and is the normal state: it means "observe it". The value
+      # is only written when observation would get it wrong, so an empty line here
+      # is not a missing setting.
+      [ -z "$val" ] && return 0
+      case "$val" in
+        none|git|github) return 0 ;;
+      esac
+      echo "integration must be none, git or github (got '$val')"
+      return 1 ;;
+    check)
+      case "$val" in
+        independent-review|self-review) return 0 ;;
+        # `none` is a fact that can be recorded, never a level that can be asked
+        # for.
+        #
+        # The two vocabularies looked identical and were not. Asked for in advance
+        # it is a standing waiver — answered once, never surfaced again, and from
+        # then on the item ships with nothing having read the diff while verify
+        # passes in silence. Recorded in outcome.md it is the honest answer when
+        # nothing could review the work, and because it ranks below every askable
+        # level it stops finish every single time and puts the decision in front of
+        # a human.
+        # One line, not four. Renderers bullet each line separately, so an
+        # explanation split across lines reads as four separate problems.
+        none)
+          echo "check cannot be 'none' — ask for independent-review or self-review; 'none' belongs in outcome.md's checked-by, where it stops finish once rather than waiving the check in advance"
+          return 1 ;;
+      esac
+      echo "check must be independent-review or self-review (got '$val')"
+      return 1 ;;
+    *)
+      echo "unknown config key: '$key'"
+      return 1 ;;
+  esac
+}
+
+# How strongly implementation work was checked, as a rank so the two records of it
+# can be compared: the level an item asked for (demand.md's `check:`) and the level
+# it got (outcome.md's `checked-by`). scripts/verify compares them, and a
+# `checked-by` below the asked-for level is the error.
+#
+# The name is `min_check` because this used to be a repository-wide *floor* in the
+# config, and the ranking was there to decide who could change it — raising a floor
+# is safe, lowering it exempts the agent from its own review. That value is retired
+# (see cue_item_check_resolved above); the ranking outlived it because comparing two
+# levels is what it was always doing.
+#
+# `none` keeps rank 0 even though no item may ask for it. The rank exists to judge
+# `checked-by`, which may still say `none` — and rank 0 is precisely what makes that
+# value fall below every level an item can ask for, and stop finish.
+cue_min_check_rank() {
+  case "$1" in
+    none)               printf '%s' 0 ;;
+    self-review)        printf '%s' 1 ;;
+    independent-review) printf '%s' 2 ;;
+    # Printed through %s, never as a bare format string: printf reads a leading
+    # `-1` as an option and fails, which left every caller comparing an empty
+    # string as an integer.
+    *)                  printf '%s' -1 ;;
+  esac
+}
+
+# Every key cue-dev still settles. These are the ones --check validates, --set
+# writes and init asks about.
+CUE_CONFIG_KEYS="marker_prefix backup_prefix remote language integration"
+
+# Written by scripts/config rather than chosen by a user, but a legitimate line in
+# the file all the same.
+#
+# `base_branch` and `branch_prefix` are deliberately *not* here. Both are gone,
+# nothing reads either, and a repository still carrying one should hear about it —
+# as an unrecognized key rather than as a setting quietly having no effect.
+#
+# `min_check` is here and they are not, and the difference is that this one is
+# still read. It moved to the item (demand.md's `check:`), but a repository
+# carrying the old line is a repository that answered this question once, and
+# cue_item_check_resolved honours that answer for items that predate the move.
+# Listing it keeps --check quiet about a line that is doing its job; scripts/config
+# still refuses to --set it and says where it went.
+CUE_CONFIG_LEGACY_KEYS="marker_prefix_history min_check"
+
+# Keys present in the file that cue-dev does not understand.
+#
+# These are a warning, not an error, and the difference matters. A typo
+# (`min_chek=none`) silently reverts a policy to its default, so it must be
+# visible — but an older plugin reading a config written by a newer one hits the
+# same condition, and refusing to run there would make every upgrade a breakage.
+# So: say it, do not stop for it.
+cue_config_unknown_keys() {
+  local key known found out=''
+  cue_config_load
+  for key in $(set | sed -n 's/^CUE_CFG_\([a-z_]*\)=.*/\1/p'); do
+    found=0
+    for known in $CUE_CONFIG_KEYS $CUE_CONFIG_LEGACY_KEYS; do
+      [ "$key" = "$known" ] && found=1
+    done
+    [ "$found" -eq 0 ] && out="$out$key "
+  done
+  printf '%s' "${out% }"
+}
+
+cue_config_validate() {
+  local problems=0 key p
+  for key in $CUE_CONFIG_KEYS; do
+    cue_validate_value "$key" "$(cue_config_get "$key" "$(cue_config_default "$key")")" || problems=1
+  done
+  # Prefixes in the history must satisfy the same syntax. If even one is broken,
+  # the old markers stamped with it can never be found again.
+  for p in $(cue_config_get marker_prefix_history ""); do
+    cue_validate_value marker_prefix "$p" >/dev/null 2>&1 \
+      || { echo "marker_prefix_history contains an unusable value: '$p'"; problems=1; }
+  done
+  [ "$problems" -eq 0 ]
+}
+
+cue_config_default() {
+  case "$1" in
+    marker_prefix) printf 'cue-dev' ;;
+    backup_prefix) printf 'cue-dev/backup/' ;;
+    language)      printf 'en' ;;
+    *) printf '' ;;
+  esac
+}
+
+# Whether any stage marker at all has been stamped in this repository.
+# Used to gate marker_prefix changes — change the prefix and there is no way left
+# to find the old markers, so all earlier work becomes invisible. That is a state
+# we cannot verify, so we never create it.
+cue_has_markers() {
+  local prefix
+  for prefix in $(cue_marker_prefixes); do
+    [ "$(cue_count_markers "$prefix")" -gt 0 ] && return 0
+  done
+  return 1
+}
+
+# The number of marker commits stamped with a given prefix. This is what lets a
+# prefix change show the user, as a number, how many move to the legacy lookup
+# path.
+cue_count_markers() {
+  local prefix=$1 stage n=0
+  for stage in $CUE_STAGES; do
+    n=$((n + $(cue_subject_count "$prefix($stage): ")))
+  done
+  printf '%s' "$n"
+}
+
+cue_work_dir() {
+  printf '%s/%s' "$(cue_works_dir)" "$1"
+}
+
+# Whether the checkout being worked in is isolated.
+#
+# In a real session no worktree was created and nobody mentioned it. Telling a
+# skill document to "say" whether it is isolated does not distinguish "isolated"
+# from "did not say". Silence reads as "we must be isolated", and later judgments
+# pile up on that false premise. So we ask git, not a person.
+#
+# A linked worktree has its own gitdir and shares the common gitdir with the main
+# checkout. When the two are the same, this is the main checkout.
+# The determination alone, without the wording. status words it its own way and
+# only when it is bad news; splitting it keeps one implementation of the git-dir
+# comparison instead of two that can drift.
+cue_isolation_kind() {
+  local git_dir common_dir
+  git_dir=$(git rev-parse --git-dir 2>/dev/null) || { printf 'undetermined\n'; return; }
+  common_dir=$(git rev-parse --git-common-dir 2>/dev/null) || { printf 'undetermined\n'; return; }
+  git_dir=$(cd "$git_dir" && pwd)
+  common_dir=$(cd "$common_dir" && pwd)
+  if [ "$git_dir" != "$common_dir" ]; then
+    printf 'worktree\n'
+  else
+    printf 'main\n'
+  fi
+}
+
+# The full sentence, used by work-init — whose output Claude reads and re-speaks
+# rather than relaying, so it is prose on purpose.
+cue_isolation() {
+  case "$(cue_isolation_kind)" in
+    worktree) printf 'worktree (%s)\n' "$(cue_repo_root)" ;;
+    main)     printf 'none — main checkout (%s)\n' "$(cue_repo_root)" ;;
+    *)        printf 'undetermined\n' ;;
+  esac
+}
+
+# Names under .cue/dev/ that would collide with a work directory.
+#
+# sdd/    is the scratch directory used during implementation. A KEY of sdd makes
+#         the two share one directory, and since the scratch is gitignored, that
+#         work's entire record goes uncommitted.
+# config  is a file. A directory of the same name cannot even be created — mkdir
+#         fails.
+#
+# The principle of not validating the KEY format still holds — this is not about
+# format but about collision.
+CUE_RESERVED_KEYS="sdd config"
+
+cue_key_is_reserved() {
+  local key=$1 r
+  for r in $CUE_RESERVED_KEYS; do
+    [ "$key" = "$r" ] && return 0
+  done
+  return 1
+}
+
+# Only checks that the KEY is safe on the filesystem. No format validation.
+cue_key_is_safe() {
+  local key=$1
+  [ -n "$key" ] || return 1
+  case "$key" in
+    *[/\\]* | *' '* | *\'* | *\"* | . | ..) return 1 ;;
+  esac
+  return 0
+}
+
+# The KEY of the item whose recorded branch is the one checked out here.
+#
+# The recorded name is matched exactly. A substring pass over the work directory
+# names follows, and only for items that recorded no branch at all — that is every
+# item started before the name was written down, for which substring matching is
+# the answer it always gave. It is a legacy path, not a fallback that invents an
+# answer for a value someone forgot to settle.
+#
+# Either way, exactly one match is a result. Two items on one branch is a question
+# only the user can settle, so the callers ask for an explicit KEY instead.
+cue_key_from_branch() {
+  local branch works match=() legacy=() k recorded
+  branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || return 1
+  [ -n "$branch" ] && [ "$branch" != HEAD ] || return 1
+  works=$(cue_works_dir)
+  [ -d "$works" ] || return 1
+
+  for k in "$works"/*; do
+    [ -d "$k" ] || continue
+    k=$(basename "$k")
+    recorded=$(cue_item_branch "$k" 2>/dev/null || true)
+    if [ -n "$recorded" ]; then
+      [ "$recorded" = "$branch" ] && match+=("$k")
+      continue
+    fi
+    case "$branch" in
+      *"$k"*) legacy+=("$k") ;;
+    esac
+  done
+
+  [ "${#match[@]}" -eq 0 ] && match=(${legacy[@]+"${legacy[@]}"})
+  if [ "${#match[@]}" -eq 1 ]; then
+    printf '%s' "${match[0]}"
+    return 0
+  fi
+  return 1
+}
+
+# The SHA of the most recent commit whose *subject* exactly equals the given
+# string.
+#
+# `git log --grep` must not be used — it looks at the whole message including the
+# body, so merely explaining the marker string in a commit body is misread as the
+# marker being present. This actually happened: a restructuring commit in this
+# repository described the marker format in its body and matched.
+# A marker is a subject. Compare against subjects only.
+# The list of commit subjects is also read once per process.
+#
+# One stage determination (cue_latest_stage) sweeps the history for 4 stages ×
+# the number of prefixes, and spawning a fresh `git log` each time puts more than
+# ten git processes into a single status run. The history does not change while
+# this process lives — whoever changes it (redo) announces that through
+# cue_log_invalidate.
+cue_log_load() {
+  [ -n "${CUE_LOG_LOADED:-}" ] && return 0
+  CUE_LOG_LOADED=1
+  CUE_LOG_CACHE=$(git log --format='%H %s' 2>/dev/null || true)
+}
+
+cue_log_invalidate() {
+  unset CUE_LOG_LOADED CUE_LOG_CACHE
+}
+
+cue_subject_commit() {
+  local want=$1 sha subject
+  cue_log_load
+  while IFS=' ' read -r sha subject; do
+    if [ "$subject" = "$want" ]; then
+      printf '%s' "$sha"
+      return 0
+    fi
+  done <<< "$CUE_LOG_CACHE"
+}
+
+# The number of commits whose subject *starts with* the given string. Callers pass
+# "<prefix>(<stage>): ".
+cue_subject_count() {
+  local want=$1 n=0 sha subject
+  cue_log_load
+  while IFS=' ' read -r sha subject; do
+    case "$subject" in "$want"*) n=$((n + 1)) ;; esac
+  done <<< "$CUE_LOG_CACHE"
+  printf '%s' "$n"
+}
+
+# The SHA of the most recent commit for that stage's marker. Empty string plus a
+# non-zero return when there is none.
+#
+# There can be several prefixes (see cue_marker_prefixes above), so all of them are
+# candidates and we take whichever the history hits first. `git log` emits newest
+# first, so the first match is the latest commit — this assumes a linear history.
+# It used to measure depth per candidate with `git rev-list --count` and compare,
+# which meant one more git process per stage to learn the same fact.
+cue_marker_commit() {
+  local stage=$1 key=$2 prefixes prefix sha subject
+  cue_log_load
+  prefixes=$(cue_marker_prefixes)
+  while IFS=' ' read -r sha subject; do
+    for prefix in $prefixes; do
+      if [ "$subject" = "$prefix($stage): $key" ]; then
+        printf '%s' "$sha"
+        return 0
+      fi
+    done
+  done <<< "$CUE_LOG_CACHE"
+  return 1
+}
+
+# Whether this item's work is already in its own start point.
+#
+# `yes` here is what lets status stop saying `▶ finish` about work that finished
+# weeks ago. Three items in a real repository were all merged into main and all
+# three read `next /cue-dev:finish`, because the last marker any of them carried
+# was `outcome` and outcome is the last marker there is.
+#
+# The obvious repair was a fifth marker stamped by finish. It is the wrong one:
+# finish is repeatable on purpose (a request opened on Monday lands on Thursday,
+# and the second run is what reclaims the workspace), the `keep` path integrates
+# nothing at all, and two of the three paths have no commit of their own to stamp.
+# A marker would have had to be invented on an empty commit to record something
+# git can already be asked.
+#
+# So it is observed, and the thing observed is the outcome marker rather than the
+# branch: the branch is usually deleted by the merge that landed it, and a check
+# that disappears at the moment it becomes true is no check. The outcome commit
+# survives the merge and keeps its SHA.
+#
+# Deliberately local and deliberately cheap — no forge, no network. status runs
+# this every time. A squash or rebase landing rewrites the commit and is reported
+# `no`, which is the same limitation scripts/integration documents and answers
+# properly, with `gh`, at the one moment it matters (finish's Step 3a).
+#
+#   exit 0  landed
+#   exit 1  not landed, or not answerable from here
+# The commit that stands for "this implementation is finished" — the marker when
+# there is one, the commit that recorded the last task when there is not.
+#
+# The marker is absent for exactly two reasons, and they need telling apart:
+#
+#   (a) implement has not stamped it yet — the item is still on the bench
+#   (b) it never existed or no longer does — implemented under the older rules
+#       where finish stamped it, or squashed/rebased/salvaged since
+#
+# Only the outcome.md that is committed and has no unrecorded rows left gets this
+# far, which already rules out most of (a). What settles the rest is the caller:
+# cue_item_landed asks whether this commit is in the item's *start point*, and an
+# item still on the bench is on its branch, not in its base. The one case that
+# cannot be told apart is an implementation committed straight onto the base
+# branch with no isolation at all — and status shouts `where ⚠ not isolated`
+# about precisely that, in the same block.
+#
+# The earlier guard here was cue_markers_lost, which was too narrow by exactly the
+# items that provoked it: `2026-08-05-gray-background` and
+# `20260806-add-test-output` were merged into main months ago and kept every
+# marker except outcome, so nothing was "lost" and both read `▶ finish` forever.
+# Landing is not a question about the markers. It is a question about the base.
+#
+# It is one function because it has two callers that must never disagree — the
+# verdict below, and the line status prints underneath it as that verdict's
+# evidence. They did disagree for one draft of this change, and the display said
+# `landed  main contains ` with the SHA simply missing.
+cue_item_outcome_commit() {
+  local key=$1
+  cue_marker_commit outcome "$key" 2>/dev/null && return 0
+  cue_outcome_recorded "$key" || return 1
+  cue_record_commit "$key" outcome.md
+}
+
+cue_item_landed() {
+  local key=$1 sha base
+  base=$(cue_item_base_ref "$key" 2>/dev/null) || return 1
+  git rev-parse --verify --quiet "$base^{commit}" >/dev/null 2>&1 || return 1
+  sha=$(cue_item_outcome_commit "$key") || return 1
+  git merge-base --is-ancestor "$sha" "$base" 2>/dev/null
+}
+
+# The stage name of the most recently stamped marker. Used to determine the
+# current stage.
+cue_latest_stage() {
+  local key=$1 prefixes prefix stage sha subject
+  cue_log_load
+  prefixes=$(cue_marker_prefixes)
+  while IFS=' ' read -r sha subject; do
+    for prefix in $prefixes; do
+      for stage in $CUE_STAGES; do
+        if [ "$subject" = "$prefix($stage): $key" ]; then
+          printf '%s' "$stage"
+          return 0
+        fi
+      done
+    done
+  done <<< "$CUE_LOG_CACHE"
+  return 1
+}
+
+# --- When the markers are gone but the records are not -----------------------
+#
+# Every record file enters history in its own marker commit — start commits
+# demand.md as `cue-dev(demand): <KEY>`, design commits design.md, plan commits
+# plan.md and the outcome skeleton together. So for a history cue-dev itself
+# wrote, one thing is always true:
+#
+#   the record is committed  <=>  its marker is in this history
+#
+# The markers were treated as the only state on the strength of that. But the
+# equivalence is a property of the *commits*, and commits do not survive being
+# rewritten. Squash-merge a work branch and main receives all four records in one
+# commit and none of the four markers. Rebase it and every marker gets a new SHA
+# and the old ones die with the branch. Delete the branch after landing the code
+# some other way and the records get salvaged onto the base branch by hand, which
+# is exactly how a real item in this repository ended up with four committed
+# records, a fully recorded outcome.md, and not one marker anywhere.
+#
+# What made that expensive was not the missing markers, it was the silence. With
+# no marker, cue_latest_stage returns nothing, which is indistinguishable from
+# never started — so status printed `next /cue-dev:start` about finished work,
+# three lines under a track showing demand ✓ design ✓ plan ✓ and 1/1 tasks
+# recorded. The screen contradicted itself and named neither half.
+#
+# So the records get to testify. They are weaker evidence than a marker and are
+# never allowed to overrule one — they are read only where a marker is absent,
+# and every surface that reads them says out loud that it did.
+
+# The record files committed in *this* history, asked once per process.
+#
+# `ls-tree HEAD` and not `ls-files`: the index would count a demand.md that was
+# staged a moment before its marker commit, and that half-second is enough to
+# report a repository as broken while it is working correctly.
+CUE_RECORDS_KEY=""
+CUE_RECORDS=""
+cue_committed_records() {
+  local key=$1 root
+  if [ "$CUE_RECORDS_KEY" = "$key" ]; then
+    printf '%s' "$CUE_RECORDS"
+    return 0
+  fi
+  root=$(cue_repo_root)
+  CUE_RECORDS=$'\n'$(git -C "$root" ls-tree -r --name-only HEAD -- ".cue/dev/$key" 2>/dev/null)$'\n'
+  CUE_RECORDS_KEY=$key
+  printf '%s' "$CUE_RECORDS"
+}
+
+cue_record_committed() {
+  local key=$1 file=$2
+  case "$(cue_committed_records "$key")" in
+    *$'\n'".cue/dev/$key/$file"$'\n'*) return 0 ;;
+  esac
+  return 1
+}
+
+# The commit that last touched a record file. The stand-in for a lost marker.
+cue_record_commit() {
+  local key=$1 file=$2 sha
+  sha=$(git log -1 --format=%H -- ".cue/dev/$key/$file" 2>/dev/null) || return 1
+  [ -n "$sha" ] || return 1
+  printf '%s' "$sha"
+}
+
+# How many task rows outcome.md holds, and how many are still unrecorded.
+#
+# The tokens are fixed to ASCII (see outcome-init). Read from the working file
+# rather than from HEAD, because a row is recorded and committed one at a time
+# during implement and the working file is the one that is current.
+#
+# `grep -c` prints its 0 and *then* exits 1 when nothing matches, so the count is
+# already correct on the failing path — `|| true` is there to keep `set -e` from
+# taking that exit as an error, not to supply a value.
+cue_rows_total() {
+  local out; out=$(cue_work_dir "$1")/outcome.md
+  [ -f "$out" ] || { printf '0'; return 0; }
+  grep -c '^- [0-9][0-9]* · ' "$out" 2>/dev/null || true
+}
+
+cue_rows_open() {
+  local out; out=$(cue_work_dir "$1")/outcome.md
+  [ -f "$out" ] || { printf '0'; return 0; }
+  grep -c '^- [0-9][0-9]* · unrecorded$' "$out" 2>/dev/null || true
+}
+
+cue_rows_open_list() {
+  local out; out=$(cue_work_dir "$1")/outcome.md
+  [ -f "$out" ] || return 0
+  sed -n 's/^- \([0-9][0-9]*\) · unrecorded$/\1/p' "$out" | paste -sd, -
+}
+
+# The three stages whose record file and marker are strictly equivalent. Each of
+# these files enters history in its own marker commit and in no other, so one
+# present without the other is proof the history was rewritten.
+#
+# outcome is deliberately not among them, and that exclusion is the whole
+# difference between a detector that works and one that cries wolf. outcome.md is
+# committed by the *plan* marker as a skeleton, and its rows are then filled in
+# and committed one at a time through implement while the outcome marker is not
+# stamped until the very end, after verify. So "outcome.md committed and fully
+# recorded, no outcome marker" is not damage — it is the last ten minutes of every
+# single implement run, and treating it as damage put the warning on the screen
+# during the normal path.
+CUE_STRICT_STAGES="demand design plan"
+
+cue_stage_record_file() {
+  case "$1" in
+    demand) printf 'demand.md' ;; design) printf 'design.md' ;;
+    plan)   printf 'plan.md' ;;   outcome) printf 'outcome.md' ;;
+  esac
+}
+
+# Whether this item's history was rewritten out from under its records: a record
+# file committed in this history whose marker commit is not.
+#
+# This is the whole detection, and it is an equality test on evidence that is
+# exact — never a guess from how finished the work looks.
+cue_markers_lost() {
+  local key=$1 s
+  for s in $CUE_STRICT_STAGES; do
+    if cue_record_committed "$key" "$(cue_stage_record_file "$s")" &&
+       ! cue_marker_commit "$s" "$key" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Whether the *committed* outcome.md says every task is recorded.
+#
+# Committed and not the working file: the working file is what implement is in the
+# middle of editing, and the committed one is a fact about this history, which is
+# the only kind of evidence admissible here.
+#
+# On its own this says the implementation is finished. It does *not* say the
+# outcome marker is missing for a bad reason — see cue_item_outcome_commit, where
+# that ambiguity is resolved.
+cue_outcome_recorded() {
+  local key=$1 committed
+  cue_record_committed "$key" outcome.md || return 1
+  committed=$(git show "HEAD:.cue/dev/$key/outcome.md" 2>/dev/null || true)
+  printf '%s\n' "$committed" | grep -q '^- [0-9][0-9]* · ' || return 1
+  ! printf '%s\n' "$committed" | grep -q '^- [0-9][0-9]* · unrecorded$'
+}
+
+# The furthest stage the committed records testify to. Only ever asked once
+# cue_markers_lost has said the markers cannot answer.
+cue_record_stage() {
+  local key=$1 s=''
+  cue_record_committed "$key" demand.md && s=demand
+  cue_record_committed "$key" design.md && s=design
+  cue_record_committed "$key" plan.md   && s=plan
+  cue_outcome_recorded "$key" && s=outcome
+  [ -n "$s" ] || return 1
+  printf '%s' "$s"
+}
+
+cue_stage_rank() {
+  case "${1:-}" in
+    demand) printf '1' ;; design) printf '2' ;;
+    plan)   printf '3' ;; outcome) printf '4' ;;
+    *)      printf '0' ;;
+  esac
+}
+
+# The stage to act on: the markers, unless there are none left to act on.
+#
+# Two conditions let the records speak, and both are facts about this history
+# rather than readings of how finished the work looks:
+#
+#   the markers are gone      cue_markers_lost — a record committed with no
+#                             marker commit to have committed it
+#   the work is in its base   cue_item_landed — whatever finish did, it is done,
+#                             and an item on the bench is on its branch instead
+#
+# Outside those two this is `cue_latest_stage` and nothing else: no record is
+# consulted, no promotion is possible, and the normal path behaves exactly as it
+# did before any of this existed. The records only ever raise the answer, never
+# lower it.
+#
+# Both surfaces ask this one function, which is what stops status from calling an
+# item done on the same screen where gate sends it back to implement.
+cue_effective_stage() {
+  local key=$1 m r
+  m=$(cue_latest_stage "$key" 2>/dev/null || true)
+  if ! cue_markers_lost "$key" && ! cue_item_landed "$key" 2>/dev/null; then
+    printf '%s' "$m"
+    return 0
+  fi
+  r=$(cue_record_stage "$key" 2>/dev/null || true)
+  if [ "$(cue_stage_rank "$r")" -gt "$(cue_stage_rank "$m")" ]; then
+    printf '%s' "$r"
+  else
+    printf '%s' "$m"
+  fi
+}
+
+# The safety net before a rewind. Prints the name of the branch it created.
+#
+# The timestamp resolves to the second, and two rewinds inside one second are not
+# hypothetical: on a fast machine a restore takes its own backup and then walks
+# back, and CI hit the collision on its first Linux run. `git branch` refused the
+# duplicate name and the rewind stopped — the one operation whose whole purpose is
+# to be recoverable, refusing because the safety net already existed.
+#
+# A counter rather than sub-second precision: `date +%N` is a GNU extension and
+# prints a literal `%N` on macOS. The suffix stays inside the `<prefix><key>-*`
+# glob that scripts/backups and scripts/restore find these by, and sorts after the
+# plain name, which is the order they were made in.
+cue_backup_branch() {
+  local key=$1 base name n=2
+  base="$(cue_backup_prefix)${key}-$(date +%Y%m%d-%H%M%S)"
+  name=$base
+  while git show-ref --verify --quiet "refs/heads/$name"; do
+    name="$base-$n"
+    n=$((n + 1))
+  done
+  git branch "$name" >/dev/null 2>&1 || {
+    echo "failed to create backup branch: $name" >&2
+    return 1
+  }
+  printf '%s' "$name"
+}
+
+# Returns 0 (= warn about it) when the commits about to be discarded are already
+# on a remote. cue-dev does not force-push. That is the user's call.
+cue_has_pushed_commits() {
+  local from=$1
+  [ -n "$(git branch -r --contains "$from" 2>/dev/null)" ]
+}
+
+# --- Cache priming -----------------------------------------------------------
+#
+# The caches above only mean anything if they are filled in the main shell. Nearly
+# every place a script reads a value is a command substitution like
+# `$(cue_marker_prefix)`, and a command substitution is a subshell — a cache first
+# filled in there dies with that subshell. Then every call re-reads, which is the
+# same as having no cache. Filling it once at source time lets every subshell
+# inherit it.
+#
+# The history cache (cue_log_load) is not primed here — that would add one
+# `git log` to scripts like scripts/marker that never look at the history at all.
+# Scripts that need it call it themselves.
+cue_repo_root >/dev/null 2>&1 || true
+cue_config_load || true

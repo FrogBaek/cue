@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# Prints the commit subject for a stage marker — and refuses to print one for
+# records that do not pass scripts/verify.
+#
+# The marker is cue-dev's entire state machine — scripts/status determines the
+# stage from it and scripts/redo finds the rewind point with it. And the user can
+# change the prefix through .cue/dev/config. That is why a skill must never
+# assemble the string itself. Leave reading the settings and interpolating them to
+# an LLM and it drifts eventually, and a drifted marker fails silently — the commit
+# succeeds and only that stage becomes invisible forever.
+#
+# **That rule is what makes this the one place a stage gate can stand.** Every
+# stage skill tells its reader to run scripts/verify before committing, and prose
+# is exactly as reliable as it sounds: in one real run of the full cycle that line
+# was followed once out of three times. `/cue-dev:redo design` was followed by a
+# hand-typed design.md (skeleton skipped, so the headings came out `#` instead of
+# `##`) committed with no verify at all; implement then stamped its outcome marker
+# with no verify either. Nothing noticed until /cue-dev:finish, where twelve errors
+# from three different stages arrived at once — a stage's worth of debt settled in
+# the one place with no stage left to fix it in.
+#
+# Every one of those commits went through this script. So the check moves here,
+# where it cannot be skipped without also giving up the marker: on failure this
+# prints verify's errors on stderr and exits 1, stdout stays empty, and
+# `git commit -m "$(marker …)"` aborts on the empty message. `--allow-empty`
+# does not rescue it — that flag permits an empty diff, not an empty subject.
+#
+# **There is deliberately no bypass flag.** One would be reached for on precisely
+# the runs this exists to stop, and a verify check that is wrong is a bug in
+# verify, fixable in one place, rather than a reason to let a stage marker outrun
+# its own record.
+#
+# Usage: scripts/marker <stage> <KEY>
+#   git commit -m "$(scripts/marker demand PROJ-142)"
+#
+#   exit 0  marker printed
+#   exit 1  the records for that stage do not pass scripts/verify
+#   exit 2  usage error / unknown stage
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=plugins/cue-dev/skills/using-cue/scripts/common
+. "$SCRIPT_DIR/common"
+
+if [ $# -ne 2 ]; then
+  echo "usage: marker <stage> <KEY>" >&2
+  exit 2
+fi
+
+stage=$1
+key=$2
+
+found=0
+for s in $CUE_STAGES; do
+  [ "$s" = "$stage" ] && found=1
+done
+if [ "$found" -eq 0 ]; then
+  echo "unknown stage: '$stage' (valid: $CUE_STAGES)" >&2
+  exit 2
+fi
+
+if ! cue_key_is_safe "$key"; then
+  echo "not usable as a KEY: '$key'" >&2
+  exit 2
+fi
+
+# The stage this marker closes, named the way scripts/verify names it. Three of
+# the four are the same word; `outcome` is the marker implement stamps at its end,
+# and the records it closes are what verify calls `--stage implement`.
+case "$stage" in
+  outcome) verify_stage=implement ;;
+  *)       verify_stage=$stage ;;
+esac
+
+# stdout is the commit subject and nothing else may reach it, so verify's report
+# is redirected wholesale to stderr — where the caller sees it beside git's own
+# refusal.
+if ! out=$("$SCRIPT_DIR/verify" "$key" --stage "$verify_stage" 2>&1); then
+  {
+    printf '%s\n' "$out"
+    echo
+    printf '  %-10s%s\n' blocked "no $stage marker while the records above fail"
+    printf '  %-10s%s\n' now "fix what verify names, then run this again"
+    printf '  %-10s%s\n' note "nothing was committed — git aborts on the empty subject"
+  } >&2
+  exit 1
+fi
+
+# Warnings survive the gate and are worth seeing; a clean pass is not. This script
+# is called inside `$(…)` on a commit line, so anything it says here lands in the
+# middle of git's output — `verify <KEY> — ok` under every stage commit of every
+# cycle is a line that teaches the reader to skip the place the warnings appear.
+if printf '%s' "$out" | grep -q '^  warning  '; then
+  printf '%s\n' "$out" >&2
+fi
+
+cue_marker "$stage" "$key"
+printf '\n'

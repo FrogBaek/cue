@@ -1,0 +1,89 @@
+name: CI
+
+# The prose files below are ignored because nothing here reads them. `docs/` is
+# deliberately not among them: test-notice.sh opens docs/output-format.md and
+# compares its whitelist against the script's, so a change there is a change to
+# something under test.
+#
+# A push that touches an ignored file and a source file still runs — the skip
+# needs every changed path to match. And the repository-wide checks that do sweep
+# these files, like the namespace grep in test-plugin-infra.sh, are deferred by
+# this rather than dropped: they read the tree as it stands, so the next run over
+# any source change sees whatever a prose-only commit left behind.
+on:
+  push:
+    branches: [main]
+    # Duplicated below rather than shared with a YAML anchor: Actions does not
+    # expand anchors, and the workflow fails to parse.
+    paths-ignore:
+      - 'README.md'
+      - 'README.ko.md'
+      - 'CHANGELOG.md'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'LICENSE'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/pull_request_template.md'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - 'README.md'
+      - 'README.ko.md'
+      - 'CHANGELOG.md'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'LICENSE'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/pull_request_template.md'
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      # shellcheck ships on the ubuntu-latest image. Pinning an action to install
+      # it would be one more thing to keep current for a tool that is already here.
+      - name: Lint every tracked shell file
+        run: tools/lint-shell.sh --all
+
+  test:
+    # Three platforms, because they fail in three different ways.
+    #
+    # macOS is here for its userland, not its hardware: its command-line tools come
+    # from BSD while Linux and Git Bash both use GNU, so a GNU-only flag or regex
+    # extension passes everywhere else and fails only here. `[0-9]\+` was the worst
+    # of them — BSD grep reads it as a literal `+`, the match silently never
+    # happens, and a check that guards a record reports nothing wrong.
+    #
+    # Windows is here because it is where this project is developed, and its
+    # differences are the ones a contributor on Linux cannot see: paths (`C:/…` from
+    # git against `/c/…` from pwd), CRLF in the working tree, and file modes that
+    # never reach the index.
+    #
+    # Free on all three while this repository is public. If it ever goes private,
+    # Linux keeps its rate, Windows bills at twice it and macOS at ten times.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    # Generous for Linux and macOS. Windows needs it: these suites spawn processes
+    # by the thousand and process creation there costs several times what it does
+    # elsewhere.
+    timeout-minutes: 30
+    defaults:
+      run:
+        # Git Bash on Windows, where the default would be PowerShell. On the other
+        # two this is already the default and changes nothing.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      # The suites build their own fixture repositories with `git init` and commit
+      # into them with an identity they pass per command, so no global git config
+      # is needed here. `jq` and `node` are on all three images.
+      - name: Run the test suites
+        run: tools/run-tests.sh

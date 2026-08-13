@@ -1,0 +1,16 @@
+{
+  "name": "cue-dev",
+  "description": "AI development workflow for Claude Code: capture the requirement, design, plan, implement, and record every change so the reasoning survives the session",
+  "version": "0.1.0",
+  "author": {
+    "name": "FrogBaek"
+  },
+  "license": "MIT",
+  "keywords": [
+    "skills",
+    "workflow",
+    "tdd",
+    "design-records",
+    "code-review"
+  ]
+}

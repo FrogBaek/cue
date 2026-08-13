@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# The start point of one work item — the ref it was cut from and the commit it was
+# cut at.
+#
+# This replaces `config --get base_ref`. The start point used to be a
+# repository-wide setting, which meant that expressing the second work item
+# required rewriting a value the first one still depended on: a git-flow hotfix
+# comes off main while the feature before it came off develop, and one value
+# cannot be both. It belongs to the ticket, so it is settled per item by
+# /cue-dev:start and recorded in that item's demand.md header:
+#
+#   <!-- base: develop @ 4f311b5 -->
+#
+# Every consumer reads it through here, so start and finish cannot disagree about
+# where a piece of work began.
+#
+# Usage:
+#   work-base <KEY>              the start ref, resolved to one that exists
+#   work-base <KEY> --sha        the commit it was cut at
+#   work-base <KEY> --show       both, as notice lines
+#   work-base --line <ref> [<committish>]   the header line, for start to write
+#
+#   exit 0  answered
+#   exit 1  no such work / this item has no recorded start point
+#   exit 2  usage error / not a repository
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=plugins/cue-dev/skills/using-cue/scripts/common
+. "$SCRIPT_DIR/common"
+
+cue_repo_root >/dev/null || exit 2
+
+usage() {
+  # The Usage block, matched rather than numbered. A fixed range is a reference
+  # nothing checks: scripts/integration grew nine header lines and its usage()
+  # went on printing the four that used to be there, so a real session asking for
+  # a form it accepts was handed a paragraph out of a design note.
+  awk '/^# Usage:/ { on = 1 } on && !/^#/ { exit } on { sub(/^# ?/, ""); print }' "$0" >&2
+  exit 2
+}
+
+# --- the emitter -------------------------------------------------------------
+#
+# start writes demand.md itself, but not this line. The same argument as
+# scripts/marker: a string other scripts parse must have exactly one author, or
+# it drifts in the one repository that formatted it differently and the drift is
+# silent — the file is written, the commit succeeds, and only that item's start
+# point becomes unreadable.
+if [ "${1:-}" = "--line" ]; then
+  shift
+  [ $# -ge 1 ] && [ $# -le 2 ] || usage
+  ref=$(cue_resolve_base "$1") || {
+    echo "no such ref locally or on any remote: '$1'" >&2
+    exit 1
+  }
+  sha=$(git rev-parse --short --verify "${2:-$ref}^{commit}" 2>/dev/null) || {
+    echo "not a commit: '${2:-$ref}'" >&2
+    exit 1
+  }
+  printf '<!-- base: %s @ %s -->\n' "$ref" "$sha"
+  exit 0
+fi
+
+[ $# -ge 1 ] && [ $# -le 2 ] || usage
+key=$1
+mode=${2:---ref}
+
+cue_key_is_safe "$key" || { echo "not usable as a KEY: $key" >&2; exit 2; }
+work=$(cue_work_dir "$key")
+[ -d "$work" ] || { echo "work not found: $key (no $work)" >&2; exit 1; }
+
+# The failure is worth naming rather than returning empty, and there is
+# deliberately nothing to fall back to. An item with no recorded start point is
+# one /cue-dev:start never settled; a repository-wide default standing in here
+# would be the last ticket's answer applied to this one, and nothing would say so
+# until the merge.
+no_answer() {
+  echo "no start point recorded for $key" >&2
+  echo "expected a header line in $work/demand.md:" >&2
+  echo "  <!-- base: <ref> @ <sha> -->    (work-base --line <ref> prints it)" >&2
+  echo "if the item was never settled, rewind it: /cue-dev:redo demand $key" >&2
+  exit 1
+}
+
+case "$mode" in
+  --ref)
+    cue_item_base_ref "$key" || no_answer
+    printf '\n'
+    ;;
+  --sha)
+    # Distinct from "no start point at all": the ref is known and the cut point is
+    # not, which means the header line was written by hand rather than by --line.
+    # Callers that can work from the ref alone (finish's ancestry check) carry on;
+    # callers that want exactness compute a merge base instead.
+    cue_item_base_sha "$key" || {
+      cue_item_base_ref "$key" >/dev/null 2>&1 || no_answer
+      echo "no cut point in $key's base line (the ref is there; the commit is not)" >&2
+      exit 1
+    }
+    printf '\n'
+    ;;
+  --show)
+    ref=$(cue_item_base_ref "$key") || no_answer
+    printf '  %-10s%s\n' base "$ref"
+    if sha=$(cue_item_base_sha "$key" 2>/dev/null); then
+      printf '  %-10s%s\n' 'cut at' "$sha"
+    else
+      printf '  %-10s%s\n' 'cut at' 'not recorded'
+    fi
+    ;;
+  *) usage ;;
+esac

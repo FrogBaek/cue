@@ -1,0 +1,54 @@
+name: A skill told Claude to do the wrong thing
+description: The scripts worked, but the instruction they serve was wrong or was not followed
+labels: [skill]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is the most valuable kind of report this project gets, and the
+        hardest to reconstruct afterwards. **If you still have the session, say so
+        — that transcript is the evidence.**
+
+        The distinction that decides the fix: was the instruction *wrong*, or was
+        it *not followed*? A wrong instruction is fixed by rewriting it. An
+        ignored one is not — it usually means the instruction is in a place the
+        session never reads, or that the easiest path through the file is the
+        wrong one.
+
+  - type: textarea
+    id: what-it-did
+    attributes:
+      label: What Claude did
+      description: The stage, and the move that looked wrong.
+    validations:
+      required: true
+
+  - type: textarea
+    id: instruction
+    attributes:
+      label: What the skill says
+      description: >
+        If you can find the line, quote it with its file. If you cannot find one,
+        say that — an instruction nobody can find is itself the finding.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Which is it, as best you can tell
+      options:
+        - The instruction is wrong
+        - The instruction is right but was not followed
+        - Not sure
+    validations:
+      required: false
+
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: Which model was driving the session, if you know.
+      placeholder: "Opus 4.6 / Sonnet 4.5 / Haiku 4.5"
+    validations:
+      required: false

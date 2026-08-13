@@ -1,0 +1,72 @@
+# --- development notes that are not part of the release -----------------------
+#
+# These exist on the maintainer's disk and are deliberately not published. They
+# are working documents, not documentation: they are written to be read by the
+# next session rather than by a user of the plugin, they are in Korean, and they
+# describe the repository's own history rather than what it does. What a reader
+# needs is in README.md and docs/.
+handoff.md
+cue-plan/
+
+# --- agent and editor state ---------------------------------------------------
+#
+# Local to one machine and one person. .claude/ in particular accumulates a
+# permission allowlist naming absolute paths on this disk.
+.claude/
+.codex/
+CLAUDE.local.md
+AGENTS.local.md
+.private-journal/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- OS junk ------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- secrets ------------------------------------------------------------------
+#
+# Nothing in this repository needs one, which is exactly when an accidental
+# commit goes unnoticed.
+.env
+.env.*
+*.pem
+*.key
+*.p12
+credentials.json
+secrets.json
+
+# --- build and run output -----------------------------------------------------
+node_modules/
+dist/
+build/
+out/
+coverage/
+*.log
+tmp/
+.tmp/
+
+# --- merge and patch leftovers ------------------------------------------------
+*.orig
+*.rej
+*.bak
+
+# --- cue-dev's own working directories ----------------------------------------
+#
+# Worktrees this repository creates for its own items. Records under
+# .cue/dev/<KEY>/ are meant to be committed, so only the scratch is ignored —
+# not all of .cue/dev/.
+.worktrees/
+.cue/dev/sdd/
+
+# --- local-only scratch -------------------------------------------------------
+#
+# The eval harness lives in its own repository and is cloned into evals/ for
+# local development; it is not part of the published plugin.
+evals/
+inspo
+triage/

@@ -1,0 +1,361 @@
+#!/usr/bin/env bash
+# Checks that a work item's records are complete and internally consistent.
+#
+# This is the gate the stage skills point at, and it exists so that the skills do
+# not have to. Every check below used to be a numbered item in a skill's prose
+# self-review — "scan for TBD", "confirm every required section is present",
+# "cross-check File Structure against each task's Files". Prose that tells a model
+# to count and compare is the defect class this repository keeps rediscovering:
+# it is spent attention, it degrades silently, and it competes with the judgment
+# the same prose is trying to convey.
+#
+# So the split is: this script does the mechanical checks, and the skills keep
+# only what needs judgment ("is this rejected alternative more than a formality?").
+# That split is also why the harness layer can thin out over time without an edit
+# here — the gate is on the artifact, never on the procedure that produced it. A
+# stronger model satisfies it in fewer moves; nothing in this file has to change.
+#
+# **It must never grow a judgment check.** A checker that starts guessing whether
+# a design is good is the next generation's dead weight.
+#
+# Usage: scripts/verify <KEY> [--stage demand|design|plan|implement]
+#   Without --stage the reached stage is inferred from the records present.
+#
+#   exit 0  no errors (warnings may still be printed)
+#   exit 1  errors found
+#   exit 2  usage error / no such work
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=plugins/cue-dev/skills/using-cue/scripts/common
+. "$SCRIPT_DIR/common"
+
+stage=""
+args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --stage) stage=${2:-}; shift 2 ;;
+    -*) echo "usage: verify <KEY> [--stage <stage>]" >&2; exit 2 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+[ "${#args[@]}" -eq 1 ] || { echo "usage: verify <KEY> [--stage <stage>]" >&2; exit 2; }
+
+key=${args[0]}
+cue_key_is_safe "$key" || { echo "not usable as a KEY: $key" >&2; exit 2; }
+work=$(cue_work_dir "$key")
+[ -d "$work" ] || { echo "work not found: $key (no $work)" >&2; exit 2; }
+
+errors=0
+warnings=0
+err()  { printf '  ERROR    %s\n' "$1"; errors=$((errors + 1)); }
+warn() { printf '  warning  %s\n' "$1"; warnings=$((warnings + 1)); }
+
+# A required `## ` heading, and — when it is not there — what *is* there instead.
+#
+# The check has not changed; the error message has. `no '## Structure' section`
+# is accurate and unusable over a file whose third line reads `# Structure`: a
+# real session read that file, concluded "design.md is present and complete", and
+# re-ran verify six times before a `sed` fixed the heading levels. Fifteen tool
+# calls and a compaction, over one missing `#`.
+#
+# That cost was survivable while this was only a report. It is not survivable now
+# that scripts/marker refuses to stamp a stage whose records fail here — a gate
+# that will not open and cannot say why is the dead-end refusal scripts/gate was
+# written to abolish, and the message is the whole of the difference.
+#
+# `exact` is whether the heading line may carry trailing text: design.md's
+# headings are looked up by name later and are matched whole, demand.md's are
+# matched as a prefix. Both report a level mismatch the same way.
+heading_check() {
+  local file=$1 want=$2 exact=$3 label=$4 found
+  if [ "$exact" = exact ]; then
+    grep -qx "## $want" "$file" && return 0
+  else
+    grep -q "^## $want" "$file" && return 0
+  fi
+  if found=$(grep -m1 -E "^#{1,6}[[:space:]]+${want}[[:space:]]*$" "$file"); then
+    err "$label: '$want' is at the wrong heading level — found '$found', expected '## $want'"
+  elif found=$(grep -m1 -E "^#{1,6}[[:space:]]+$want" "$file"); then
+    err "$label: '$want' heading carries trailing text — found '$found', expected exactly '## $want'"
+  else
+    err "$label: no '## $want' section"
+  fi
+}
+
+# Infer how far the work got from what is on disk. A record that does not exist
+# yet is not a defect — it is a stage that has not run.
+if [ -z "$stage" ]; then
+  stage=none
+  [ -f "$work/demand.md" ]  && stage=demand
+  [ -f "$work/design.md" ]  && stage=design
+  [ -f "$work/plan.md" ]    && stage=plan
+  if [ -f "$work/outcome.md" ] && ! grep -q '^- [0-9][0-9]* · unrecorded$' "$work/outcome.md"; then
+    stage=implement
+  fi
+fi
+
+# Text outside fenced code blocks. Every content check runs against this rather
+# than the raw file: a plan step that legitimately writes `// TODO` into sample
+# code must not read as an unfinished plan.
+prose() {
+  awk '/^```/ { infence = !infence; next } !infence' "$1"
+}
+
+# --- demand ------------------------------------------------------------------
+
+if [ -f "$work/demand.md" ]; then
+  heading_check "$work/demand.md" 'Requirement' prefix demand.md
+  heading_check "$work/demand.md" 'Acceptance criteria' prefix demand.md
+  grep -q '^<!-- cue-dev · written ' "$work/demand.md" \
+    || warn "demand.md: no provenance header (written date · source)"
+elif [ "$stage" != none ]; then
+  err "demand.md is missing"
+fi
+
+# --- design ------------------------------------------------------------------
+#
+# The heading list is fixed, and an empty section is a readable answer ("we looked
+# and there was nothing"). That is why a missing heading is an error while a thin
+# one is not checked at all: the skeleton is the contract, the depth is judgment.
+
+# `Divergence from demand` is here for the same reason `Planned contract changes`
+# is: the answer is usually "none", and an absent heading cannot be told apart
+# from a stage that never looked. It records the case the rewind path does not
+# cover — a requirement that grew during design rather than one that could not be
+# designed against at all.
+DESIGN_HEADINGS="Structure|What we build|Worked example|Why this way|Rejected alternatives|Divergence from demand|Constraints at the time|Program design|How we know it works|Planned contract changes"
+
+if [ -f "$work/design.md" ]; then
+  IFS='|' read -r -a headings <<< "$DESIGN_HEADINGS"
+  for h in "${headings[@]}"; do
+    heading_check "$work/design.md" "$h" exact design.md
+  done
+
+  # Contract changes carry a fixed shape so documentation tooling can grep six
+  # months of them out of the history. "none" is the normal answer.
+  contracts=$(awk '/^## Planned contract changes/ { on = 1; next }
+                   /^## / { on = 0 } on' "$work/design.md")
+  if printf '%s' "$contracts" | grep -q '^- '; then
+    while IFS= read -r line; do
+      case "$line" in
+        '- '*': '*' — '*) ;;
+        '') ;;
+        *) err "design.md: contract line is not 'kind: target — description': $line" ;;
+      esac
+    done < <(printf '%s\n' "$contracts" | grep '^- ')
+  elif ! printf '%s' "$contracts" | grep -qi 'none'; then
+    err "design.md: 'Planned contract changes' is empty — write 'none' if there are none"
+  fi
+
+  # Same rule, same reason: left blank, "nothing diverged" and "nobody checked"
+  # look identical. No shape is imposed on the lines — what a divergence is worth
+  # saying about is judgment, and the only mechanical claim available is that the
+  # stage answered at all.
+  divergence=$(awk '/^## Divergence from demand/ { on = 1; next }
+                    /^## / { on = 0 } on' "$work/design.md" | tr -d '[:space:]')
+  [ -n "$divergence" ] \
+    || err "design.md: 'Divergence from demand' is empty — write 'none' if the design builds what demand.md asked for"
+elif [ "$stage" != none ] && [ "$stage" != demand ]; then
+  err "design.md is missing"
+fi
+
+# --- plan --------------------------------------------------------------------
+
+if [ -f "$work/plan.md" ]; then
+  grep -q '^\*\*Goal:\*\*'         "$work/plan.md" || err "plan.md: no '**Goal:**' line"
+  grep -q '^\*\*Architecture:\*\*' "$work/plan.md" || err "plan.md: no '**Architecture:**' line"
+  heading_check "$work/plan.md" 'Global Constraints' prefix plan.md
+
+  # Task parsing uses the same rules as task-brief and outcome-init. If the three
+  # ever drift, the row numbers stop matching the tasks actually dispatched.
+  tasks=$(awk '/^```/ { infence = !infence; next }
+               !infence && /^#+[ \t]+Task[ \t]+[0-9]+/ { n++ }
+               END { print n + 0 }' "$work/plan.md")
+  [ "$tasks" -gt 0 ] || err "plan.md: no tasks found (expected '### Task N: name')"
+
+  # Interfaces are the input to the dependency graph and the only place an
+  # implementer learns a neighbouring task's symbol names. Empty ones fail loudly
+  # nowhere else — the graph just comes back empty. Counting blocks against tasks
+  # catches the omission without this script having to model task boundaries.
+  for field in 'Files' 'Interfaces'; do
+    got=$(prose "$work/plan.md" | grep -c "^\*\*${field}:\*\*" || true)
+    [ "$got" -ge "$tasks" ] \
+      || err "plan.md: ${got} '**${field}:**' blocks for ${tasks} tasks — every task needs one"
+  done
+fi
+
+# --- placeholders ------------------------------------------------------------
+#
+# One scan for both documents rather than a numbered item in each skill.
+
+for f in design.md plan.md; do
+  [ -f "$work/$f" ] || continue
+  hits=$(prose "$work/$f" | grep -nE '\b(TBD|TODO|FIXME)\b|\bfill in (the )?(details|later)\b|\bimplement later\b' || true)
+  if [ -n "$hits" ]; then
+    while IFS= read -r h; do
+      err "$f: unfinished placeholder — ${h}"
+    done <<< "$hits"
+  fi
+
+  # The frame scripts/skeleton wrote, still unfilled. Its prompts are the one
+  # placeholder shape this repository controls, so they are worth checking
+  # exactly rather than by heuristic — and an unfilled frame reaching a commit is
+  # the failure mode a generated frame introduces that a hand-typed one does not.
+  frame=$(prose "$work/$f" | grep -n '\[\[' || true)
+  if [ -n "$frame" ]; then
+    while IFS= read -r h; do
+      err "$f: unfilled skeleton prompt — ${h}"
+    done <<< "$frame"
+  fi
+done
+
+# --- outcome -----------------------------------------------------------------
+
+if [ -f "$work/outcome.md" ]; then
+  rows=$(grep -c '^- [0-9][0-9]* · ' "$work/outcome.md" || true)
+  open=$(grep -c '^- [0-9][0-9]* · unrecorded$' "$work/outcome.md" || true)
+
+  if [ -f "$work/plan.md" ]; then
+    [ "$rows" -eq "${tasks:-0}" ] \
+      || err "outcome.md: ${rows} rows for ${tasks:-0} tasks in plan.md — rows are replaced, never added or removed"
+  fi
+
+  if [ "$open" -gt 0 ]; then
+    listing=$(sed -n 's/^- \([0-9][0-9]*\) · unrecorded$/\1/p' "$work/outcome.md" | paste -sd, -)
+    if [ "$stage" = implement ]; then
+      err "outcome.md: ${open} unrecorded rows (${listing})"
+    else
+      warn "outcome.md: ${open} rows still unrecorded (${listing}) — implementation is not finished"
+    fi
+  fi
+
+  # Every recorded row names the task's last commit. A row pointing at a commit
+  # that does not exist is a row written from memory.
+  #
+  # Existing is not enough, and finding that out cost a whole run. In a real
+  # session every task was implemented and committed in the *main checkout* — a
+  # forgotten `git -C <worktree>`, which start's 4c calls the most important line
+  # in that step — so the item's branch ended up holding its six record commits
+  # and not one line of code. Every gate downstream passed: the row named a commit
+  # that existed, the marker was on the branch, the suite was green (it ran against
+  # a tree that did have the change), and finish printed a box saying the branch
+  # held "every commit and record".
+  #
+  # `cat-file -e` cannot catch that, because the commit is real. What it is not is
+  # *on this item's branch*, and the branch is recorded, so this is one question
+  # away. It is the same repair the rest of cue-dev has already made twice: read
+  # the item's record instead of asking git where you happen to be standing.
+  #
+  # Skipped when the branch is not recorded or no longer exists — a landed item's
+  # branch is deleted by the merge that landed it, and a row is not wrong for
+  # having outlived it.
+  item_branch=$(cue_item_branch "$key" 2>/dev/null || true)
+  if [ -n "$item_branch" ] \
+     && git rev-parse --verify --quiet "$item_branch^{commit}" >/dev/null 2>&1; then
+    reach_branch=$item_branch
+  else
+    reach_branch=""
+  fi
+
+  # Two rows naming one commit. The row format asks for "that task's last
+  # commit", and a task that produced no commit of its own has no answer to
+  # that — so a real run gave task 10 ("integration test and final
+  # verification") the SHA already recorded for task 9, and every check here
+  # passed: the commit exists, it is on the branch, no row is unrecorded. The
+  # record then said two tasks were delivered by one commit that only ever
+  # contained one of them.
+  #
+  # `no-commit` is the way out and it is why this can be an error rather than a
+  # warning: a task with nothing to point at says so, in the same slot, and the
+  # difference between "no commit" and "somebody else's commit" stops being a
+  # judgment call made under pressure to fill the field.
+  dup=$(sed -n 's/^- [0-9][0-9]* · \([0-9a-f]\{7,40\}\) · .*/\1/p' "$work/outcome.md" \
+          | sort | uniq -d)
+  if [ -n "$dup" ]; then
+    while IFS= read -r sha; do
+      [ -n "$sha" ] || continue
+      err "outcome.md: ${sha} is recorded for more than one task — a task with no commit of its own is recorded as 'no-commit', not against another task's"
+    done <<< "$dup"
+  fi
+
+  while IFS= read -r sha; do
+    if ! git cat-file -e "${sha}^{commit}" 2>/dev/null; then
+      err "outcome.md: row names a commit that does not exist: ${sha}"
+    elif [ -n "$reach_branch" ] \
+         && ! git merge-base --is-ancestor "$sha" "$reach_branch" 2>/dev/null; then
+      err "outcome.md: ${sha} is not on ${reach_branch} — the work was committed somewhere else (a forgotten \`git -C <worktree>\` puts it in the main checkout), or the branch was rebased and the row still names the old commit"
+    fi
+  done < <(sed -n 's/^- [0-9][0-9]* · \([0-9a-f]\{7,40\}\) · .*/\1/p' "$work/outcome.md")
+
+  # Evidence strength. demand.md's `check:` holds what this item asked for;
+  # outcome.md's `checked-by` holds what actually happened. Comparing the two is
+  # the whole point of recording the second — a record that merely echoed the
+  # first would prove nothing.
+  #
+  # Both halves are now per item. The asked-for level used to be `min_check` in
+  # the config, one number for the whole repository, and it could not be the right
+  # answer for a colour change and a migration at once; scripts/work-check carries
+  # the argument for the move, and reads a leftover config line for items that
+  # predate it.
+  checked=$(sed -n 's/^checked-by:[[:space:]]*\([a-z-]*\).*/\1/p' "$work/outcome.md" | head -1)
+  evidence=$(sed -n 's/^evidence:[[:space:]]*\([a-z-]*\).*/\1/p' "$work/outcome.md" | head -1)
+
+  if [ -z "$checked" ]; then
+    err "outcome.md: no 'checked-by:' line"
+  elif [ "$checked" != unrecorded ]; then
+    if [ "$(cue_min_check_rank "$checked")" -lt 0 ]; then
+      err "outcome.md: checked-by must be independent-review, self-review or none (got '$checked')"
+    elif [ "$checked" = none ]; then
+      # Always an error, in every repository, because `none` is not a level any
+      # item may ask for. That is deliberate rather than incidental: the value
+      # stays writable so a run where nothing read the diff can say so honestly,
+      # and stopping here is what turns that honesty into a decision a human makes
+      # once, for this item — instead of a setting that waives the check for
+      # everything that follows, in silence.
+      err "outcome.md: checked-by is 'none' — nothing read this work's diff"
+      err "  a human decides what happens next: review it, or accept it explicitly."
+      err "  neither check level clears this — it is the one answer no level allows."
+    else
+      asked=$(cue_item_check_resolved "$key")
+      [ "$(cue_min_check_rank "$checked")" -ge "$(cue_min_check_rank "$asked")" ] \
+        || {
+          err "outcome.md: checked-by is '$checked' but this item asked for '$asked'"
+          err "  asked for in: $(cue_item_check_source "$key")"
+          err "  either the work gets the check it asked for, or say why it could not:"
+          err "  record what happened, and let finish put the difference in front of a human."
+        }
+    fi
+  elif [ "$stage" = implement ]; then
+    err "outcome.md: checked-by is still 'unrecorded' with every task recorded"
+  fi
+
+  case "$evidence" in
+    red-output|tests-only|manual|none) ;;
+    unrecorded)
+      [ "$stage" = implement ] && err "outcome.md: evidence is still 'unrecorded' with every task recorded" ;;
+    '') err "outcome.md: no 'evidence:' line" ;;
+    *) err "outcome.md: evidence must be red-output, tests-only, manual or none (got '$evidence')" ;;
+  esac
+fi
+
+# --- config ------------------------------------------------------------------
+
+unknown=$(cue_config_unknown_keys)
+[ -n "$unknown" ] && warn "config: unrecognized keys, cue-dev reads its defaults instead: $unknown"
+problems=$(cue_config_validate) || {
+  while IFS= read -r p; do err "config: $p"; done <<< "$problems"
+}
+
+# --- verdict -----------------------------------------------------------------
+
+printf '\n'
+if [ "$errors" -eq 0 ] && [ "$warnings" -eq 0 ]; then
+  printf 'verify %s — ok (stage: %s)\n' "$key" "$stage"
+elif [ "$errors" -eq 0 ]; then
+  printf 'verify %s — ok with %s warning(s) (stage: %s)\n' "$key" "$warnings" "$stage"
+else
+  printf 'verify %s — %s error(s), %s warning(s) (stage: %s)\n' \
+    "$key" "$errors" "$warnings" "$stage"
+  exit 1
+fi

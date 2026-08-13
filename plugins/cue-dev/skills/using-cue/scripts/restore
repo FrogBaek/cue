@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+# Goes back to one of the backup branches scripts/redo left behind.
+#
+# Every rewind creates one of these and scripts/redo's box prints its name, but
+# nothing in cue-dev has ever known how to *use* one. cue-dev:redo says three
+# times that the backup is "the only recovery path if the rewind was a mistake"
+# and never says how to walk it — so in a real session the user asked to get the
+# plan back and the answer was a hand-rolled `git log` followed by
+# `git reset --hard <sha>`, chosen by eye. That is the exact move `cue-dev:using-cue`
+# forbids, and it was the only move available.
+#
+# Two things follow from what a restore actually is.
+#
+# **It is not "undo". It is another rewind, pointing the other way.** Rewind at
+# design, redo the design, then restore: the new design is gone. So this carries
+# every protection scripts/redo carries — a preview that counts both directions,
+# consent in the conversation rather than at a prompt, and a backup of the current
+# HEAD taken before anything moves.
+#
+# **The branch is never chosen for you.** Two rewinds leave two backups and the
+# one wanted is usually the older — realising that the first rewind was the
+# mistake is what the second rewind teaches. There is no `--latest`, and a lone
+# backup is not implied either: a rule that guesses when there is one candidate is
+# a rule that has never been practised on the day there are two.
+#
+# Usage:
+#   scripts/restore [KEY]                              list the backups
+#   scripts/restore [KEY] --to <branch> [--dry-run|--yes]
+#
+#   Omit the KEY and it is matched from the current branch name.
+#
+#   exit 0  listed, previewed, or restored
+#   exit 1  nothing to restore / refused / cancelled
+#   exit 2  usage error
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=plugins/cue-dev/skills/using-cue/scripts/common
+. "$SCRIPT_DIR/common"
+
+cue_log_load
+
+usage() {
+  awk '/^# Usage:/ { on = 1 } on && !/^#/ { exit } on { sub(/^# ?/, ""); print }' "$0" >&2
+  exit 2
+}
+
+assume_yes=0
+dry_run=0
+target=""
+key=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --to) target=${2:-}; [ -n "$target" ] || usage; shift 2 ;;
+    --yes) assume_yes=1; shift ;;
+    --dry-run) dry_run=1; shift ;;
+    -*) usage ;;
+    *) [ -z "$key" ] || usage; key=$1; shift ;;
+  esac
+done
+
+if [ -z "$key" ]; then
+  key=$(cue_key_from_branch) || {
+    echo "no KEY found from the current branch. Pass one: scripts/restore <KEY>" >&2
+    exit 2
+  }
+fi
+cue_key_is_safe "$key" || { echo "not usable as a KEY: $key" >&2; exit 2; }
+
+work=$(cue_work_dir "$key")
+head_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
+
+# --- the same two refusals scripts/redo makes --------------------------------
+#
+# A restore is a reset, so it reaches the same wrong branch in the same two ways.
+# Landed work: the backup's commits are in the base branch's history too, and
+# resetting from there would take the base branch back with them. Work whose
+# branch is not the one checked out: the reset lands on whatever is.
+item_branch=$(cue_item_branch "$key" 2>/dev/null || true)
+blocked=""
+if cue_item_landed "$key" 2>/dev/null; then
+  blocked=landed
+elif [ -n "$item_branch" ] && [ "$item_branch" != "$head_branch" ]; then
+  blocked=elsewhere
+fi
+
+if [ -n "$blocked" ]; then
+  cue_head "RESTORE blocked"
+  echo
+  printf '  %-10s%s\n' key "$key"
+  case "$blocked" in
+    landed)
+      base=$(cue_item_base_ref "$key" 2>/dev/null || echo 'its start point')
+      printf '  %-10sthis work has landed in %s — the commits are part of that branch now\n' \
+        blocked "$base"
+      printf '  %-10s/cue-dev:start  — a change to landed work is new work\n' now
+      ;;
+    elsewhere)
+      printf "  %-10sthis item's work is on %s; HEAD is %s\n" blocked "$item_branch" "$head_branch"
+      printf '  %-10snothing was changed\n' note
+      if git rev-parse --verify --quiet "refs/heads/$item_branch" >/dev/null 2>&1; then
+        printf '  %-10sgit switch %s  — then run this again\n' now "$item_branch"
+      else
+        printf '  %-10sthe branch %s does not exist here — it was deleted, or this is another clone\n' \
+          now "$item_branch"
+      fi
+      ;;
+  esac
+  printf '  %-10s/cue-dev:status %s\n' now "$key"
+  cue_rule
+  exit 1
+fi
+
+# --- the candidates ----------------------------------------------------------
+#
+# Scoped to this KEY, exactly as scripts/backups is scoped, and for the same
+# reason: the branches at the same prefix belonging to other items are those
+# items' only recovery path. The trailing `-` keeps PROJ-14 out of PROJ-142's
+# list — cue_backup_branch always appends `-<timestamp>`.
+#
+# Newest first, which sorts by name because the timestamp is the suffix.
+found=$(git for-each-ref --format='%(refname:short)' \
+  "refs/heads/$(cue_backup_prefix)${key}-*" 2>/dev/null | sort -r || true)
+
+if [ -z "$found" ]; then
+  cue_head "RESTORE blocked"
+  echo
+  printf '  %-10s%s\n' key "$key"
+  printf '  %-10sno backup branches for this item — nothing has been rewound\n' blocked
+  printf '  %-10s/cue-dev:status %s\n' now "$key"
+  cue_rule
+  exit 1
+fi
+
+# The last stage marker on a branch. Not cue_latest_stage, which reads the cached
+# log of HEAD — the whole question here is what is on a branch HEAD is not.
+branch_stage() {
+  local ref=$1 prefixes prefix stage subject
+  prefixes=$(cue_marker_prefixes)
+  while IFS= read -r subject; do
+    for prefix in $prefixes; do
+      for stage in $CUE_STAGES; do
+        if [ "$subject" = "$prefix($stage): $key" ]; then
+          printf '%s' "$stage"
+          return 0
+        fi
+      done
+    done
+  done < <(git log --format=%s "$ref" 2>/dev/null)
+  return 1
+}
+
+if [ -z "$target" ]; then
+  # The listing is the whole answer when no branch was named, and it has to carry
+  # enough to choose with. `2 hours ago` distinguishes nothing between two
+  # rewinds in one afternoon; the stage and the two counts do.
+  cue_head "RESTORE candidates"
+  echo
+  printf '  %-10s%s\n' key "$key"
+  printf '  %-10s%s\n' head "$head_branch @ $(git rev-parse --short HEAD)"
+  echo
+  while IFS= read -r b; do
+    printf '  %-10s%s  (%s)\n' backup "$b" "$(git log -1 --format=%cr "$b")"
+    printf '  %-10s%s\n' '' "holds up to $(branch_stage "$b" || echo 'no stage marker') · $(git rev-list --count "HEAD..$b") commit(s) not on $head_branch · $(git rev-list --count "$b..HEAD") made since"
+  done <<< "$found"
+  echo
+  printf '  %-10s%s\n' now "scripts/restore $key --to <backup> --dry-run"
+  printf '  %-10s%s\n' note "nothing is chosen for you — a restore discards what was done after the rewind"
+  cue_rule
+  exit 0
+fi
+
+# --- a named branch ----------------------------------------------------------
+#
+# Checked against this item's list rather than against git: `--to main` is a
+# request to reset the branch onto main, and it would work.
+case $'\n'"$found"$'\n' in
+  *$'\n'"$target"$'\n'*) ;;
+  *)
+    cue_head "RESTORE blocked"
+    echo
+    printf '  %-10s%s\n' key "$key"
+    printf '  %-10s%s is not a backup branch of this item\n' blocked "$target"
+    printf '  %-10sscripts/restore %s  — the ones that are\n' now "$key"
+    cue_rule
+    exit 1 ;;
+esac
+
+# Uncommitted work. `git reset --hard` would take it, and this command is reached
+# by someone trying to get something back — losing something else on the way is
+# the one outcome it must not have. Scoped to what the reset actually touches:
+# tracked changes anywhere, and untracked files inside this item's record
+# directory. An untracked directory elsewhere in the tree is not this script's
+# business and refusing over it would make the refusal the normal case.
+dirty=""
+git diff --quiet HEAD 2>/dev/null || dirty="tracked files have uncommitted changes"
+if [ -z "$dirty" ] && [ -d "$work" ]; then
+  root=$(cue_repo_root)
+  if [ -n "$(git -C "$root" ls-files --others --exclude-standard -- "${work#"$root"/}")" ]; then
+    dirty="the record directory holds untracked files"
+  fi
+fi
+
+if [ -n "$dirty" ]; then
+  cue_head "RESTORE blocked"
+  echo
+  printf '  %-10s%s\n' key "$key"
+  printf '  %-10s%s — a restore resets the tree and would take them\n' blocked "$dirty"
+  printf '  %-10s%s\n' now "commit them, or discard them deliberately, then run this again"
+  printf '  %-10s%s\n' note "nothing was changed"
+  cue_rule
+  exit 1
+fi
+
+regain=$(git rev-list --count "HEAD..$target")
+discard=$(git rev-list --count "$target..HEAD")
+stage=$(branch_stage "$target" || echo 'no stage marker')
+
+cue_head "RESTORE preview"
+echo
+printf '  %-10s%s\n' key "$key"
+printf '  %-10s%s\n' restore "$target"
+printf '  %-10s%s\n' stage "$stage"
+printf '  %-10s%s commits back onto %s\n' regain "$regain" "$head_branch"
+# The half a restore is most likely to be run without having thought about. It is
+# printed even when it is zero, because "nothing is lost" is the answer that makes
+# the rest of the box safe to act on and it should not have to be inferred from an
+# absent line.
+printf '  %-10s%s commits made since the rewind\n' discard "$discard"
+printf '  %-10s%s\n' backup "the current $head_branch is saved to a new backup branch first"
+if [ "$discard" -gt 0 ] && cue_has_pushed_commits HEAD; then
+  printf '  %-10s⚠ already pushed — force-push is your call\n' remote
+fi
+echo
+
+if [ "$dry_run" -eq 1 ]; then
+  printf '  %-10sask the user, then re-run with --yes\n' consent
+  printf '  %-10snothing was changed\n' preview
+  # Closed, because this is where the output ends. The interactive path below
+  # leaves it open on purpose — the prompt and then the DONE box follow.
+  cue_rule
+  exit 0
+fi
+
+if [ "$assume_yes" -ne 1 ]; then
+  printf '  %-10stype yes to proceed: ' confirm
+  if ! read -r answer; then
+    echo
+    printf '  %-10sno input attached — ask the user, then re-run with --yes\n' confirm
+    exit 1
+  fi
+  echo
+  [ "$answer" = "yes" ] || { printf '  %-10snothing was changed\n' cancelled; exit 1; }
+fi
+
+saved=$(cue_backup_branch "$key")
+git reset --hard "$target" >/dev/null
+cue_log_invalidate
+
+cue_head "RESTORE done"
+echo
+printf '  %-10s%s\n' key "$key"
+printf '  %-10s%s  (%s · %s commits)\n' restored "$target" "$stage" "$regain"
+printf '  %-10s%s\n' saved "$saved"
+printf '  %-10s%s\n' '' "the state before this restore — this is now the way back"
+
+# The question this script was written to add. scripts/redo asks what to do with
+# the earlier backups when it makes one; nothing asked after a recovery, so the
+# branch that had just been consumed sat in `git branch` looking like a recovery
+# path it no longer was. It is not one: HEAD is standing on it.
+echo
+printf '  %-10s%s is no longer a way back — it is where you are now\n' stale "$target"
+printf '  %-10sgit branch -D %s\n' delete "$target"
+
+others=$(printf '%s\n' "$found" | grep -vFx "$target" || true)
+if [ -n "$others" ]; then
+  printf '  %-10s%s other backup(s) for this item remain\n' note "$(printf '%s\n' "$others" | grep -c .)"
+fi
+
+echo
+printf '  %-10s/cue-dev:status %s\n' next "$key"
+cue_rule

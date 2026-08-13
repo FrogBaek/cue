@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# How work leaves this repository, and whether a given item has already left.
+#
+# /cue-dev:start abstracted "where does the work come from" into one line of
+# demand.md, and every stage reads it from there. This is the same move on the
+# other end: "where does the work go" is answered once, here, so that finish's
+# integration question is built from what this repository can actually do rather
+# than from a forge that was assumed when the skill was written.
+#
+# What is *not* an adapter concern: merging into the landing branch. That is plain
+# git, it needs no forge, and it is available wherever a landing branch was
+# settled. Folding it in would have made "merge locally" a GitHub feature.
+#
+# So it is not an action here, and that is the second thing this script encodes.
+# `request` and `keep` decide what happens to *this item*; both leave the work on
+# this item's branch, so N items reach the end of finish at the same time without
+# meeting. Merging decides something else — whether to take the main checkout,
+# right now, for as long as the tests run. Two sessions handed that as an action
+# will both take it and both walk into the same working tree. So the actions are
+# item-scoped, and finish offers the merge alongside them under its own lock
+# (`scripts/merge-lock`) rather than getting it from here.
+#
+# The word "menu" used to be all over this file. Finish had a four-way menu before
+# Step 9 replaced it with one question asked after the notice; the tokens below did
+# not change, only what the caller does with them.
+#
+# Two questions, and the second is the reason this is a script rather than a
+# paragraph:
+#
+#   which actions exist    from the adapter — see cue_integration in common
+#   has it landed already  from the adapter *too*, because the honest answer
+#                          differs. `merge-base --is-ancestor` proves a merge
+#                          commit and disproves nothing: GitHub's squash button
+#                          rewrites the commits, so a landed branch looks
+#                          unlanded. A skill computing this in prose would report
+#                          "not landed" for the single most common way work lands.
+#
+# Usage:
+#   integration                    the adapter, the remote, and the actions
+#   integration --actions          the actions, one per line, nothing else
+#   integration --landed <KEY>     yes | no | unknown, with the reason
+#
+#   exit 0  answered (including `landed no` — it is an answer, not a failure)
+#   exit 1  no such work / this item has no recorded branch
+#   exit 2  usage error / not a repository
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=plugins/cue-dev/skills/using-cue/scripts/common
+. "$SCRIPT_DIR/common"
+
+cue_repo_root >/dev/null || exit 2
+
+# The Usage block, found by matching rather than by line number.
+#
+# It used to be `sed -n '27,30p'`, correct on the day it was written. The header
+# above then grew by nine lines and nothing moved the range with it, so a real
+# session that ran `integration --actions <KEY>` — a reasonable guess, the other
+# subcommand takes a KEY — was answered with a paragraph out of the middle of a
+# design note: *"Two questions, and the second is the reason this is a script
+# rather than a paragraph: which actions exist — from the adapter, see
+# cue_integration in common."* Nothing in that names a form the script accepts,
+# and the session's next move was to drop the argument and hope.
+#
+# A line number into a comment block is a reference nothing checks. The heading
+# is the anchor now, and the block ends at the first line that is not indented
+# under it.
+usage() {
+  awk '/^# Usage:/ { on = 1 } on && !/^#/ { exit } on { sub(/^# ?/, ""); print }' "$0" >&2
+  exit 2
+}
+
+adapter=$(cue_integration)
+
+# The actions finish may offer, in the order it offers them.
+#
+#   request  publish the branch and open a change request   (finish 9b)
+#   keep     no integration act now — finish words this "Not now"   (finish 9a)
+#
+# **This is the machine-readable answer, and `--actions` is how to ask it.** The
+# display below prints a `request` line under every adapter, because under `none`
+# that line exists to say the action is unavailable — so a caller testing whether
+# the word `request` appeared gets `yes` in the one repository where the answer is
+# `no`. finish branched on exactly that at two of its steps. Tokens here, prose
+# there.
+#
+# `keep` is unconditional and is not a fallback for `request` being unavailable:
+# "I have not decided yet" is a real answer to a real question, and it is the one
+# that leaves the branch and its four records exactly as they are. It is also what
+# keeps this list from ever coming back empty, which a caller cannot tell apart
+# from a script that failed.
+#
+# `merge` is deliberately absent. See the header: it is repository scope, and
+# finish offers it under its own lock rather than getting it from here.
+actions() {
+  [ "$adapter" = none ] || printf 'request\n'
+  printf 'keep\n'
+}
+
+# --- has this item's work already landed? -----------------------------------
+#
+# Called on a re-run of finish: the request was opened last week and merged since,
+# and the branch and worktree are still sitting here. finish stamps no marker, so
+# it is repeatable by design — this is what makes the repeat useful.
+landed() {
+  local key=$1 branch base state
+  cue_key_is_safe "$key" || { echo "unusable KEY: '$key'" >&2; exit 2; }
+  [ -d "$(cue_repo_root)/.cue/dev/$key" ] || { echo "no such work: $key" >&2; exit 1; }
+
+  branch=$(cue_item_branch "$key") || true
+  if [ -z "$branch" ]; then
+    echo "no recorded branch for $key — scripts/work-branch --relink from the workspace" >&2
+    exit 1
+  fi
+
+  # The forge first, when there is one that can answer. It is the only source that
+  # survives a squash or a rebase landing, because it tracks the request rather
+  # than the commits.
+  if [ "$adapter" = github ] && command -v gh >/dev/null 2>&1; then
+    state=$(gh pr view "$branch" --json state,number,mergedAt \
+              --template '{{.state}} {{.number}}' 2>/dev/null) || state=""
+    case "$state" in
+      MERGED*)
+        printf '  %-10s%s\n' landed yes
+        printf '  %-10s%s\n' evidence "gh: pull request #${state##* } is merged"
+        return 0 ;;
+      OPEN*)
+        printf '  %-10s%s\n' landed no
+        printf '  %-10s%s\n' evidence "gh: pull request #${state##* } is still open"
+        return 0 ;;
+      CLOSED*)
+        printf '  %-10s%s\n' landed no
+        printf '  %-10s%s\n' evidence "gh: pull request #${state##* } was closed without merging"
+        return 0 ;;
+    esac
+    # No request found, or gh could not answer. Fall through to git rather than
+    # calling that a no — an unopened request and an unreachable forge look
+    # identical from here.
+  fi
+
+  base=$("$SCRIPT_DIR/work-base" "$key" 2>/dev/null) || {
+    printf '  %-10s%s\n' landed unknown
+    printf '  %-10s%s\n' reason "no recorded start point — nothing to compare against"
+    return 0
+  }
+
+  if git merge-base --is-ancestor "refs/heads/$branch" "$base" 2>/dev/null; then
+    printf '  %-10s%s\n' landed yes
+    printf '  %-10s%s\n' evidence "$branch is contained in $base"
+    return 0
+  fi
+
+  # Not contained. This is where the honest answer is `unknown` rather than `no`,
+  # and only the adapter knows which: with a forge that can be asked, silence
+  # above already meant no request. Without one, a squash or rebase landing leaves
+  # no ancestry at all and is indistinguishable from work that never went in.
+  if [ "$adapter" = none ]; then
+    printf '  %-10s%s\n' landed no
+    printf '  %-10s%s\n' evidence "$branch is not contained in $base, and there is no forge to ask"
+  else
+    printf '  %-10s%s\n' landed unknown
+    printf '  %-10s%s\n' reason "$branch is not contained in $base — but a squash or rebase landing would look the same"
+    printf '  %-10s%s\n' 'what now' "ask the user whether it landed; do not report this as not landed"
+  fi
+}
+
+case "${1:-}" in
+  --actions)
+    [ $# -eq 1 ] || usage
+    actions ;;
+
+  --landed)
+    [ $# -eq 2 ] || usage
+    landed "$2" ;;
+
+  '')
+    remote=$(cue_remote)
+    [ -n "$remote" ] || remote=$(git remote 2>/dev/null | head -1)
+    printf '  %-10s%s\n' adapter "$adapter"
+    if [ -n "$(cue_config_get integration "")" ]; then
+      printf '  %-10s%s\n' source "set in .cue/dev/config"
+    else
+      printf '  %-10s%s\n' source "observed — no integration line in .cue/dev/config"
+    fi
+    printf '  %-10s%s\n' remote "${remote:-none}"
+    printf '  %-10s%s\n' actions "$(actions | tr '\n' ' ' | sed 's/ $//')"
+    case "$adapter" in
+      github) printf '  %-10s%s\n' request "gh pr create — and gh can say whether it merged" ;;
+      git)    printf '  %-10s%s\n' request "push, then open the request outside cue-dev" ;;
+      none)   printf '  %-10s%s\n' request "not available here — keep the branch, or merge afterwards" ;;
+    esac
+    printf '  %-10s%s\n' merge "finish offers it at Step 9 under scripts/merge-lock — never an action here" ;;
+
+  *) usage ;;
+esac

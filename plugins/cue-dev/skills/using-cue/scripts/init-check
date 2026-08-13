@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+# Determines whether the repository is ready to use cue-dev. Changes nothing.
+#
+# This script exists so that /cue-dev:init never guesses. In a real test run, the
+# absence of a base branch only surfaced at /cue-dev:finish — by which point the
+# work was done and there was nowhere to open a PR. Readiness has to be determined
+# before starting, in one shot, deterministically.
+#
+# Usage: init-check
+#   exit 0  ready (may already be initialized — see the config line)
+#   exit 1  blocked (no commits, etc. — the reason is on the blocked line)
+#   exit 2  not a repository
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=plugins/cue-dev/skills/using-cue/scripts/common
+. "$SCRIPT_DIR/common"
+
+# Marker lookups sweep the history several times. Read it once in the main shell.
+cue_log_load
+
+root=$(cue_repo_root) || exit 2
+blocked=""
+
+printf 'repo           %s\n' "$root"
+
+# --- Are there commits? ------------------------------------------------------
+# Branching in a repository with zero commits produces an unborn branch, and the
+# first commit lands on it, so no base branch is ever created. This actually
+# happened.
+if git rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
+  printf 'commits        %s\n' "$(git rev-list --count HEAD)"
+else
+  printf 'commits        0\n'
+  blocked="the repository has no commits"
+fi
+
+# --- Start point candidates --------------------------------------------------
+#
+# Reported, never settled. The branch work is cut from belongs to the work item,
+# so /cue-dev:start settles it per item and records it in that item's demand.md
+# (scripts/work-base). What init can usefully say is which branches are there to
+# choose from, so start has something to propose when the ticket does not say.
+#
+# This never blocks. It used to: a `base_branch` in the config that resolved to
+# nothing stopped init, which meant one stale line in a settings file stood
+# between the user and every piece of work in the repository — over a value that
+# is not a setting at all any more. A repository still carrying that line hears
+# about it through the unrecognized-keys report, which is what it now is.
+#
+# Resolved through cue_resolve_base, which also looks on the remotes. Clone a
+# git-flow repository and `develop` exists only as `origin/develop`; checking
+# refs/heads alone hid the one candidate such a repository needs.
+cands=""
+for b in main master develop trunk; do
+  cue_resolve_base "$b" >/dev/null 2>&1 && cands="$cands $b"
+done
+cands=${cands# }
+if [ -n "$cands" ]; then
+  printf 'start_points   candidates: %s (start settles this per work item)\n' "$cands"
+else
+  printf 'start_points   no candidates among main/master/develop/trunk\n'
+fi
+
+# What this repository already calls its branches.
+#
+# There is no branch_prefix setting to read any more, and there should not be one:
+# the name belongs to the work item and to the team's convention. But start still
+# has to propose something, and the convention is *observable* — it is written on
+# every branch in the repository. Reading it beats storing it, which is the same
+# rule that keeps the landing point out of the settings file.
+#
+# Prefixes only, most used first, and only from local branches: a `feature/` that
+# exists solely on a remote is not yet this checkout's habit.
+styles=$(git for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null \
+  | sed -n 's|^\([^/]*/\).*|\1|p' | sort | uniq -c | sort -rn \
+  | awk '{ printf "%s ", $2 }' || true)
+styles=${styles% }
+if [ -n "$styles" ]; then
+  printf 'branch_style   in use: %s (start proposes; nothing is required)\n' "$styles"
+else
+  printf 'branch_style   no prefixed branches yet (start proposes a name to confirm)\n'
+fi
+
+# --- Remotes -----------------------------------------------------------------
+# finish used to hardcode origin. In a fork workflow where the remote is named
+# upstream, that simply fails.
+remotes=$(git remote 2>/dev/null | paste -sd' ' - || true)
+configured_remote=$(cue_remote)
+if [ -n "$configured_remote" ]; then
+  printf 'remote         %s (configured)\n' "$configured_remote"
+elif [ -z "$remotes" ]; then
+  printf 'remote         none (local only — the PR path is unavailable)\n'
+else
+  printf 'remote         unset (available: %s)\n' "$remotes"
+fi
+
+# --- Current branch ----------------------------------------------------------
+# Uses git branch --show-current. On an unborn branch with no commits, rev-parse
+# --abbrev-ref prints "HEAD" to stdout while also failing, which produces two lines.
+branch=$(git branch --show-current 2>/dev/null || true)
+printf 'branch         %s\n' "${branch:-(none)}"
+
+# --- gitignore ---------------------------------------------------------------
+# Without this, the scratch gets mixed into commits during implementation and the
+# controller improvises a .gitignore commit nobody planned. This actually happened.
+if git check-ignore -q .cue/dev/sdd/probe 2>/dev/null; then
+  printf 'gitignore      ok (.cue/dev/sdd/ is ignored)\n'
+else
+  printf 'gitignore      no rule for .cue/dev/sdd/\n'
+fi
+if git check-ignore -q .cue/dev/SOME-KEY/demand.md 2>/dev/null; then
+  printf 'gitignore      WARNING: .cue/dev/<KEY>/ is ignored — records will not be committed\n'
+fi
+# The worktree directory. using-git-worktrees calls verifying this "critical" and
+# "MUST", and until now nothing checked it — the one gitignore rule this script
+# looked at was the scratch. An unignored .worktrees/ commits an entire second
+# checkout into the repository on the next `git add -A`, and cue-dev now creates
+# that directory itself rather than asking a harness to place it somewhere else.
+if git check-ignore -q .worktrees/probe 2>/dev/null; then
+  printf 'gitignore      ok (.worktrees/ is ignored)\n'
+else
+  printf 'gitignore      no rule for .worktrees/ — cue-dev cuts worktrees there\n'
+fi
+
+# --- gitattributes -----------------------------------------------------------
+# Never touched. It changes the line-ending normalization policy for the whole
+# repository, so the next commit can surface every existing file as a diff. Report
+# only.
+if [ -f "$root/.gitattributes" ]; then
+  printf 'gitattributes  present\n'
+else
+  printf 'gitattributes  absent (Windows prints a CRLF warning per commit — informational)\n'
+fi
+
+# --- Settings ----------------------------------------------------------------
+#
+# The language first, and as an instruction rather than a value. /cue-dev:init and
+# /cue-dev:start both begin here, and both used to conduct their entire question
+# sequence in English in a repository configured for something else — the
+# SessionStart hook had said so once, an English skill body then said everything
+# else, and init's own language section is written for the case where the value is
+# not yet set and so is skipped entirely when it is. See the same line in
+# scripts/gate, which covers the stages that start there instead — including why
+# it goes to stderr while every other line here goes to stdout. Short version:
+# stdout is what this repository is, stderr is what the model reading it should
+# do, and only the first of those is ever the user's answer.
+printf 'language       %s — reply to the user in this language; the skill you are reading is English by convention, not by instruction\n' \
+  "$(cue_language)" >&2
+
+if [ -f "$(cue_config_file)" ]; then
+  printf 'config         present\n'
+  if problems=$(cue_config_validate); then
+    printf 'config_valid   ok\n'
+  else
+    printf 'config_valid   has problems\n'
+    printf '%s\n' "$problems" | sed 's/^/config_problem /'
+    blocked="the config has problems"
+  fi
+else
+  printf 'config         absent (all defaults)\n'
+  printf 'config_valid   ok\n'
+fi
+
+printf 'marker_prefix  %s\n' "$(cue_marker_prefix)"
+# No branch_prefix line. The work branch is named per item and recorded there, so
+# there is nothing repository-wide to report; what is left is the namespace
+# cue-dev keeps its own backup branches in.
+printf 'backup_prefix  %s\n' "$(cue_backup_prefix)"
+
+# --- Markers -----------------------------------------------------------------
+# If markers exist, changing marker_prefix must record the old prefix in the
+# history.
+if cue_has_markers; then
+  printf 'markers        present (changing marker_prefix records the old one in the config)\n'
+else
+  printf 'markers        none (marker_prefix is still free to choose)\n'
+fi
+
+# --- Work items --------------------------------------------------------------
+works=$(cue_works_dir)
+if [ -d "$works" ]; then
+  n=$(find "$works" -mindepth 1 -maxdepth 1 -type d ! -name sdd 2>/dev/null | grep -c . || true)
+  # Says what it counts, because it was read as something else. A session relayed
+  # `works 2` to the user as "there are 2 works in progress", and the user
+  # reasonably took them for debris left by an earlier experiment and asked for
+  # them to be deleted — they were the committed records of two finished items,
+  # which is the thing cue-dev exists to accumulate. This number never falls.
+  # Whether any given one is still open is /cue-dev:status's question.
+  printf 'works          %s recorded under .cue/dev/ (finished items keep their records — this is not a count of open work)\n' "$n"
+else
+  printf 'works          0 recorded under .cue/dev/\n'
+fi
+
+if [ -n "$blocked" ]; then
+  printf 'blocked        %s\n' "$blocked"
+  exit 1
+fi
+printf 'blocked        none\n'

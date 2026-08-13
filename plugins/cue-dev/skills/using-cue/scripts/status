@@ -1,0 +1,362 @@
+#!/usr/bin/env bash
+# Prints how far the current work got and what to do next.
+#
+# It is essential for three reasons. (1) When a session breaks, there is no other
+# way to know how far it got. (2) It is the only standing path for outcome.md's
+# unrecorded rows to surface before the PR. (3) It is how you check what will
+# disappear before using scripts/redo.
+#
+# Usage: scripts/status [KEY]
+#   Omit the KEY and it matches the current branch name against .cue/dev/.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=plugins/cue-dev/skills/using-cue/scripts/common
+. "$SCRIPT_DIR/common"
+
+# Stage detection sweeps the history several times. Without reading it once in the
+# main shell, every command-substitution subshell spawns a fresh `git log`.
+cue_log_load
+
+if [ $# -gt 1 ]; then
+  echo "usage: scripts/status [KEY]" >&2
+  exit 2
+fi
+
+key=${1:-}
+if [ -z "$key" ]; then
+  # No KEY given and none recoverable from the branch. This used to print "pass
+  # one: scripts/status <KEY>" and exit 2 — the refusal that names what failed and
+  # nothing to do about it, which is the exact shape scripts/gate was written to
+  # replace. It is also the *normal* state for landed work: the item records the
+  # branch it was cut onto, that branch is deleted by the merge, and from the base
+  # branch nothing matches any more.
+  #
+  # gate already answers this properly — nothing is in progress on this branch,
+  # and here is what may be done instead. Handing the question over is what keeps
+  # one answer instead of two that drift. (It does *not* name the items in
+  # `.cue/dev/`; that listing was the bug, and gate's comment says why.)
+  key=$(cue_key_from_branch) || exec "$SCRIPT_DIR/gate" status
+fi
+
+cue_key_is_safe "$key" || { echo "not usable as a KEY: $key" >&2; exit 2; }
+
+work=$(cue_work_dir "$key")
+[ -d "$work" ] || { echo "work not found: $key (no $work)" >&2; exit 1; }
+
+# ✓ committed · ~ present but uncommitted · · absent
+#
+# Printing ✓ merely because the file exists makes the display contradict itself —
+# design.md ✓ alongside "next /cue-dev:design" is a state that actually occurs
+# (written but not yet committed). The stage rests on the marker, not on the files,
+# so the display has to expose that difference.
+#
+# The evidence is gathered once for the whole work directory. Calling git twice per
+# file spawns eight processes for four files, and that was a large part of how slow
+# status felt.
+root=$(cue_repo_root)
+work_rel=${work#"$root"/}
+tracked=$'\n'$(git -C "$root" ls-files -- "$work_rel")$'\n'
+if git rev-parse --verify --quiet HEAD >/dev/null; then
+  has_head=1
+  changed=$'\n'$(git -C "$root" diff --name-only HEAD -- "$work_rel")$'\n'
+else
+  # With no commits there is nothing to compare against. Everything present is
+  # uncommitted.
+  has_head=0
+  changed=""
+fi
+
+mark() {
+  local rel="$work_rel/$1"
+  [ -f "$work/$1" ] || { printf '·'; return; }
+  case "$tracked" in
+    *$'\n'"$rel"$'\n'*) ;;
+    *) printf '~'; return ;;                    # untracked
+  esac
+  if [ "$has_head" -eq 0 ]; then
+    printf '~'; return
+  fi
+  case "$changed" in
+    *$'\n'"$rel"$'\n'*) printf '~' ;;           # changed since the commit
+    *) printf '✓' ;;
+  esac
+}
+
+# Task progress — counts the unrecorded rows in the skeleton plan.md created.
+#
+# The tokens are fixed to ASCII (see the comment in outcome-init). If this parsing
+# depended on a setting that can change (language), the moment the language changed
+# past records would become unreadable.
+#
+# Counted by line first, then joined for display. Counting after joining with
+# commas comes up one short — the last item has no trailing newline.
+tasks_total=$(cue_rows_total "$key")
+tasks_open_count=$(cue_rows_open "$key")
+tasks_open=$(cue_rows_open_list "$key")
+tasks_done=$((tasks_total - tasks_open_count))
+
+# The marker where there is one, the committed records where the marker that
+# should have been there is gone. `lost` is the second half and is never left
+# unsaid — see cue_markers_lost, and the `history` line further down.
+stage=$(cue_effective_stage "$key")
+lost=no
+cue_markers_lost "$key" && lost=yes
+
+# `here` is the stage the user is standing on — the one still to do, not the last
+# one finished. The track draws it, so no line has to spell the phase out in words.
+case "$stage" in
+  demand)  here=design;    next="/cue-dev:design";    undo="/cue-dev:redo demand" ;;
+  design)  here=plan;      next="/cue-dev:plan";      undo="/cue-dev:redo design" ;;
+  plan)    here=implement; next="/cue-dev:implement"; undo="/cue-dev:redo plan" ;;
+  outcome) here=finish;    next="/cue-dev:finish";    undo="/cue-dev:redo implement" ;;
+  *)       here=demand;    next="/cue-dev:start $key"; undo="(no stage to rewind)" ;;
+esac
+
+# Legacy items only. implement stamps the outcome marker now, so a finished
+# implementation reaches the `outcome` case above and never gets here. What still
+# does is an item implemented before the marker moved: every row recorded, the
+# last marker still plan. Reading it the same way costs nothing and keeps those
+# items legible; `scripts/gate` is stricter and will send them through implement
+# again, which is the honest answer for a record that genuinely has no marker.
+#
+# The rewind hint has to change with it — recommending /cue-dev:redo plan at this
+# point means following the hint destroys the plan too. Redoing only the
+# implementation is implement.
+if [ "$stage" = "plan" ] && [ "$tasks_total" -gt 0 ] && [ "$tasks_open_count" -eq 0 ]; then
+  here=finish
+  next="/cue-dev:finish"
+  undo="/cue-dev:redo implement"
+fi
+
+# Even one recorded task means implementation has started. Recommending plan here
+# too would destroy not just the code commits already made but the plan as well.
+if [ "$stage" = "plan" ] && [ "$tasks_done" -gt 0 ] && [ "$tasks_open_count" -gt 0 ]; then
+  undo="/cue-dev:redo implement"
+fi
+
+# A rewind needs a marker to rewind *to*, and in this state there is none —
+# scripts/redo looks the marker up and refuses. Offering the command anyway would
+# make status the one thing it must never be: the line the user follows into a
+# refusal. Nothing here is recoverable by rewinding, because nothing here was
+# lost from the tree; only the history that produced it is gone.
+if [ "$lost" = yes ]; then
+  undo="(the stage markers are not in this history — nothing to rewind to)"
+fi
+
+# Whether this is over.
+#
+# Without this, it never is. The last marker cue-dev stamps is `outcome`, so an
+# item that merged into main weeks ago still reads `▶ finish · next
+# /cue-dev:finish` — three items in a real repository did, all three merged, and
+# the only way to know was to read the git log by hand. status exists so nobody has
+# to do that.
+#
+# It is observed rather than marked, and that is not a shortcut. finish is
+# repeatable on purpose, its `keep` path integrates nothing, and two of its three
+# paths have no commit of their own — a fifth marker would have had to be invented
+# on an empty commit to record something git can be asked. See cue_item_landed for
+# why the outcome commit is the thing asked about and not the branch.
+landed=no
+if cue_item_landed "$key" 2>/dev/null; then
+  landed=yes
+  # Quoted: bare `done` after `here=` reads as a loop keyword to shellcheck, and
+  # the value is a sentinel no slot name can equal, so no caret is drawn.
+  here="done"
+  next="(none — this work is in $(cue_item_base_ref "$key" 2>/dev/null || echo 'its start point'))"
+  # No rewind is offered, and the parenthetical this line used to carry is why.
+  # It read `(rewinds the branch — what landed stays landed)`, which described a
+  # branch that a merge had already deleted. What the command actually reached was
+  # the base branch the user was standing on, and `scripts/redo` reset it: the
+  # marker lookup finds the plan commit in main's history too, because the merge
+  # put it there. A real session was shown this line over an item whose rewind
+  # would have discarded seventeen commits from main, the merge among them.
+  #
+  # redo refuses that case outright now. This line stops offering it, because the
+  # one thing status must never be is the line the user follows into a refusal —
+  # and when the refusal is the only thing standing between an offer and a reset
+  # of main, the offer should not have been printed.
+  undo="(none — this work has landed; a change to it is new work)"
+fi
+
+# One slot of the track: the stage name, the state of the artifact it produces, and
+# a caret when it is where the user stands. finish gets no glyph — it stamps
+# nothing and is deliberately repeatable, so there is no state it could show that
+# would not be a guess.
+slot() {
+  local name=$1 glyph=$2 out=''
+  [ "$name" = "$here" ] && out='▶ '
+  out="$out$name"
+  [ -n "$glyph" ] && out="$out $glyph"
+  printf '%s' "$out"
+}
+
+g_demand=$(mark demand.md)
+g_design=$(mark design.md)
+g_plan=$(mark plan.md)
+
+# outcome.md is written at plan time and filled in row by row, and each row is
+# committed as it is written — so its file state says nothing about whether the
+# implementation is done. The glyph keys off the outcome marker instead, which is
+# the only thing that does mean finished: it is stamped once, at the end of
+# implement, after verify passes.
+#
+# Reading the file state here used to be right, back when rows sat uncommitted for
+# the whole of implement. Once rows became commits, that reading turned into a ✓
+# appearing halfway through the implementation — the display claiming the work was
+# done while tasks were still open.
+#
+# This glyph used to sit on the finish slot, because the marker used to be stamped
+# there. It moved with the marker.
+if [ ! -f "$work/outcome.md" ]; then
+  g_implement='·'
+elif [ "$stage" = outcome ]; then
+  g_implement='✓'
+else
+  g_implement='~'
+fi
+
+# The KEY is a value like any other, so it sits in the body on a labelled line.
+# It used to be the title, which put the longest and most variable string in the
+# block into the one place that decides the frame's width — a 33-character KEY
+# stretched the whole box sideways to say something the `key` line says in place.
+# Every surface now opens with a fixed-width title.
+cue_head "STATUS"
+echo
+printf '  %-10s%s\n' key "$key"
+echo
+printf '  %s   %s   %s   %s   %s\n' \
+  "$(slot demand "$g_demand")" "$(slot design "$g_design")" "$(slot plan "$g_plan")" \
+  "$(slot implement "$g_implement")" "$(slot finish "$([ "$landed" = yes ] && printf '✓')")"
+echo
+
+# Which evidence the track above was drawn from, whenever it was not the markers.
+#
+# This is the line whose absence cost the most. Without it the display simply
+# contradicted itself — three ✓ records and a fully recorded outcome.md over
+# `next /cue-dev:start` — and left the reader to work out which half to believe,
+# with nothing on the screen even hinting that the two halves had different
+# sources. Naming the weaker evidence is the price of being allowed to use it.
+if [ "$lost" = yes ]; then
+  printf '  %-10s⚠ stage read from the committed records — no cue-dev markers in this history\n' history
+  printf '  %-10s%s\n' '' "(a squash or rebase landing, or records committed outside cue-dev)"
+fi
+
+# The evidence, not just the verdict. A line saying the work is done, with nothing
+# behind it, is the kind of claim status was written to replace.
+if [ "$landed" = yes ]; then
+  printf '  %-10s%s\n' landed "$(cue_item_base_ref "$key") contains $(git rev-parse --short "$(cue_item_outcome_commit "$key")")"
+# "not landed" and "cannot be asked" are different answers, and only one of them
+# justifies `▶ finish`. Landing is a question about the item's start point, and
+# items written before start points were recorded (7554e0f moved it into
+# demand.md) do not have one — so for those the question has no subject, and the
+# display was quietly rendering that as `no`. `2026-08-05-gray-background` in the
+# practice repository merged months ago and read `next /cue-dev:finish` forever
+# because of it.
+#
+# Only said when the implementation looks finished. Before that the item is
+# genuinely not landed and the missing start point is not what is interesting
+# about it.
+elif cue_outcome_recorded "$key" 2>/dev/null && ! cue_item_base_ref "$key" >/dev/null 2>&1; then
+  printf '  %-10s%s\n' landed "unknown — this item records no start point, so there is no base to look in"
+fi
+
+if [ "$tasks_total" -gt 0 ]; then
+  if [ "$tasks_open_count" -gt 0 ]; then
+    printf '  %-10s%s/%s recorded · open %s\n' tasks "$tasks_done" "$tasks_total" "$tasks_open"
+  else
+    printf '  %-10s%s/%s recorded\n' tasks "$tasks_done" "$tasks_total"
+  fi
+fi
+
+# The glyphs need no legend while everything is ✓ or ·, which is most of the time.
+# `~` is the one that has to be explained, so it explains itself when it appears —
+# and only then, or the line stops being read.
+case "$g_demand$g_design$g_plan" in
+  *'~'*) printf '  %-10s~ = written but not committed\n' legend ;;
+esac
+
+# Only the abnormal case is printed. Isolation used to be shown always, on the
+# reasoning that a missing line would be read as "isolated" — but a line that is
+# there every single time stops being read at all, and it was the longest line in
+# the block. Shouting only when the work is NOT isolated puts the weight on the
+# state that can actually hurt.
+#
+# What can hurt got worse, and this line got a second job because of it. cue-dev
+# cuts its own worktrees now and does not ask the harness to move the session into
+# them, so the work is done with `git -C <path>` from wherever the session stands.
+# A forgotten `-C` edits the main checkout — the one real cost of dropping the
+# harness tool, named as such when that trade was made. So when this item has a
+# worktree and you are not in it, the answer is not "you are not isolated" but the
+# path itself: the fix is to name it, and a warning that withholds the value you
+# need is a warning you route around.
+here=$(cue_repo_root 2>/dev/null || true)
+recorded=$(cue_item_worktree "$key" 2>/dev/null || true)
+
+# The record says where the worktree was cut; it does not say whether it is still
+# there, and finish removes it. So a finished item pointed at a deleted directory
+# and told the reader to run `git -C <that path> …`, which fails — the one thing a
+# line offering a command must not do. The record is not wrong, it is just no
+# longer news, so drop it rather than repairing it: this item is not somewhere
+# else, it is nowhere.
+if [ -n "$recorded" ] && [ ! -d "$recorded" ]; then
+  recorded=""
+fi
+
+# Silent once the work has landed. Every branch of this block warns about where
+# the next edit would go, and for finished work there is no next edit — "you are
+# not isolated" under a line saying the item is done is a warning about nothing,
+# printed in the position the eye has learned to check for real ones.
+case "$([ "$landed" = yes ] && printf 'landed' || cue_isolation_kind)" in
+  landed) ;;
+  worktree)
+    if [ -n "$recorded" ] && [ "$here" != "$recorded" ]; then
+      printf '  %-10s⚠ a worktree, but not this item'"'"'s — its work is at %s\n' where "$recorded"
+    fi
+    ;;
+  main)
+    if [ -n "$recorded" ]; then
+      printf '  %-10s⚠ main checkout — this item'"'"'s worktree is %s\n' where "$recorded"
+      printf '  %-10s%s\n' '' "work in it with: git -C $recorded …"
+    else
+      printf '  %-10s⚠ not isolated — main checkout (%s)\n' where "$here"
+    fi
+    ;;
+  *)        printf '  %-10s⚠ cannot tell whether this is a worktree\n' where ;;
+esac
+
+
+echo
+printf '  %-10s%s\n' next "$next"
+printf '  %-10s%s\n' rewind "$undo"
+
+# The rewinds this box was not offering.
+#
+# `undo` above is the nearest one — one stage back from where the caret stands —
+# and for a long time it was the only thing said here. But rewinding is not
+# limited to one stage: cue-dev:redo has a section headed "Rewinding past more
+# than one stage is allowed, and it cascades", scripts/redo accepts any stamped
+# stage at any time, and its refusal path already lists every stage that can be
+# reached. Only this line disagreed, and a user who followed it would have
+# believed `design` was unreachable from `implement` — while the command they
+# were not shown worked exactly as designed.
+#
+# So the fix is not to restrict redo. It is to stop under-reporting here, in the
+# vocabulary redo already prints: the stages whose markers actually exist.
+#
+# Not said when `undo` is not an offer. Every one of those cases — landed work,
+# markers missing from this history, nothing stamped at all — is a state where
+# naming more commands is naming more refusals.
+case "$undo" in
+  /cue-dev:redo*)
+    others=""
+    for s in plan design demand; do
+      [ "$undo" = "/cue-dev:redo $s" ] && continue
+      cue_marker_commit "$s" "$key" >/dev/null 2>&1 || continue
+      others="${others:+$others · }$s"
+    done
+    [ -n "$others" ] && printf '  %-10s/cue-dev:redo %s  — further back, discarding everything after it\n' \
+      '' "$others"
+    ;;
+esac
+cue_rule

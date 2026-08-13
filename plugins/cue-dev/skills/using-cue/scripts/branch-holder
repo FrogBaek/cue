@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Which worktree, if any, has a branch checked out.
+#
+# One repository can hold several cue-dev items at once, and worktrees are what
+# makes that safe: each has its own HEAD and index, so two items being built in
+# parallel never touch each other's files. Exactly one path breaks that symmetry —
+# finish's `merge` path, which leaves the item's worktree, checks out the landing
+# branch in the main checkout, merges and runs the tests there. That is repository
+# scope, and two sessions reaching it at the same time interleave.
+#
+# git already refuses to check out a branch that another worktree holds. What it
+# does not do is say so before the merge sequence starts, in words that name the
+# other workspace — so the failure lands halfway through, after the worktree has
+# been left, looking like a broken tool rather than like another session working.
+#
+# **This does not answer "is another session merging right now."** In the ordinary
+# layout the landing branch is checked out in the main checkout, which is exactly
+# where every merging session goes — so both get `checked out here` and both
+# proceed, into the same working tree. That is `scripts/merge-lock`, and finish's
+# Step 9 runs both: the lock for the sequence, this for the checkout.
+#
+# Usage: scripts/branch-holder <branch>
+#   exit 0  free — no worktree has it checked out
+#   exit 1  held — prints the holder as notice lines
+#   exit 2  usage error / not a repository
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=plugins/cue-dev/skills/using-cue/scripts/common
+. "$SCRIPT_DIR/common"
+
+cue_repo_root >/dev/null || exit 2
+
+[ $# -eq 1 ] || { echo "usage: scripts/branch-holder <branch>" >&2; exit 2; }
+want=$1
+want=${want#refs/heads/}
+
+# The porcelain form is stanzas separated by blank lines: `worktree <path>`, then
+# `HEAD <sha>`, then `branch refs/heads/<name>` (absent when detached). Reading it
+# as pairs is what keeps this from matching a path that merely contains the name.
+here=$(cue_repo_root)
+path=""
+holder=""
+while IFS= read -r line; do
+  case "$line" in
+    'worktree '*) path=${line#worktree } ;;
+    'branch '*)
+      if [ "${line#branch refs/heads/}" = "$want" ]; then
+        holder=$path
+        break
+      fi
+      ;;
+  esac
+done < <(git worktree list --porcelain 2>/dev/null)
+
+[ -n "$holder" ] || exit 0
+
+# Normalized the same way everywhere else in cue-dev: `git worktree list` prints
+# `D:/repo/...` on Windows while `pwd -P` gives `/d/repo/...`, and comparing the
+# two raw forms says "another worktree" about the directory you are standing in.
+holder=$(cd "$holder" 2>/dev/null && pwd || printf '%s' "$holder")
+
+if [ "$holder" = "$here" ]; then
+  printf '  %-10s%s\n' branch "$want — checked out here"
+  exit 0
+fi
+
+printf '  %-10s%s\n' branch "$want — checked out in another worktree"
+printf '  %-10s%s\n' holder "$holder"
+printf '  %-10s%s\n' 'what now' 'another session may be working there; merge from that checkout, or wait'
+exit 1

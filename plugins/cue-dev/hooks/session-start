@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# SessionStart hook for cue-dev plugin
+
+set -euo pipefail
+
+# Determine plugin root directory
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# The scripts live under a skill, not at the plugin root.
+#
+# <cue> names exactly one directory, and it is this one. A second scripts folder
+# anywhere else is a token nobody defined — scripts called from there resolve
+# against wherever the Bash tool happened to be standing, and every call in a
+# dispatch loop dies as `command not found`. Nesting them under the skill that
+# defines <cue> is what keeps that from being possible. Nothing else had to
+# change: every script resolves its siblings through its own $(dirname "$0").
+SCRIPTS_DIR="${PLUGIN_ROOT}/skills/using-cue/scripts"
+
+# Read using-cue content
+using_cue_content=$(cat "${PLUGIN_ROOT}/skills/using-cue/SKILL.md" 2>&1 || echo "Error reading using-cue skill")
+
+# Escape string for JSON embedding using bash parameter substitution.
+# Each ${s//old/new} is a single C-level pass - orders of magnitude
+# faster than the character-by-character loop this replaces.
+escape_for_json() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+using_cue_escaped=$(escape_for_json "$using_cue_content")
+
+# Language directive.
+#
+# cue-dev's own scripts print English regardless. What this sets is the language
+# Claude writes in — the conversation and the prose inside demand.md, design.md,
+# plan.md, and outcome.md. This hook is the one place a main session can be told
+# once; subagents don't get hooks, so the implement skill injects the same line
+# at dispatch time.
+#
+# The directive is unconditional. There is no "not decided" value to fall through
+# on: every skill body, every script line and every template heading in this plugin
+# is English, so silence here is not neutrality — it is a vote for English, cast in
+# repositories that never asked for it. Saying the language out loud, even when it
+# is the default `en`, is the only way `ko` in .cue/dev/config actually beats the
+# English text Claude is reading.
+#
+# We do not guess from $LANG — it is empty on Windows Git Bash, where this was
+# built, so the guess would simply be wrong. Unreadable config means the default.
+#
+# The hook's cwd is not guaranteed to be the project root, so ask git explicitly
+# with $CLAUDE_PROJECT_DIR when the harness provides it.
+language=$(cd "${CLAUDE_PROJECT_DIR:-$PWD}" 2>/dev/null \
+    && "${SCRIPTS_DIR}/config" --get language 2>/dev/null) || language=en
+language=${language%%[[:space:]]*}
+case "$language" in
+    [a-z][a-z]) ;;
+    *) language=en ;;
+esac
+
+language_directive="\n\n**Output language: \`${language}\` (from .cue/dev/config).** Write to the user in this language, and write the prose inside .cue/dev/ records in it too. The skill bodies, the templates and the script output you are about to read are English by repository convention — that is not an instruction about your output language. This governs prose only: commit markers, outcome.md status tokens, section headings in the record templates, file paths, and code stay exactly as specified. cue-dev's scripts print English; relay their meaning in \`${language}\` rather than pasting the raw output. That holds hardest for \`scripts/gate\` and \`scripts/init-check\`, whose \`blocked\` and \`now\` lines are for you to act on — the user gets what they mean, not the lines.\n\n**The notice block is the exception — reproduce it verbatim, and it is the last thing in your reply.** The \`━━━\` box that scripts/status, scripts/redo and scripts/notice print is what the user came for, and it is label-and-value only: file paths, SHAs, branch names and commands, none of which translate. Put it in your reply inside a fenced code block, unchanged and complete, **and put it last.** Summarizing it instead leaves the user with a tool output collapsed to three lines and no way to see the rest. **Do not then walk its labels in prose** — 'artifact: the requirement record was created' is the box again at twice the length, and it is pure cost. Anything you do need to say — a decision you need from the user, a warning, the answer to what they actually asked — goes *above* the box. Nothing goes under it.\n\n**And no achievement summary above it either — no check-mark list, no 'what was done', no count of anything.** The box is the report. A real session put six check-marked lines over one, and two of them were false: 'branch and workspace cleaned up' over a workspace still on disk, and '14 clean commits' over a number nobody had counted. That is what the summary is for structurally — it is the one place in the reply where a sentence enters that no script produced and no gate checked, and the sentences that appear there are the ones the run wishes were true. What may go above the box is a question, a warning, or the answer to what the user asked, and each of those is something they cannot get from the box itself. **And never draw the box yourself** — the frame means a cue-dev stage produced it; scripts/notice refuses any other title, so a hand-drawn one is a forgery. Report anything cue-dev has no stage for as ordinary prose. To change the language: \`/cue-dev:init\`."
+
+# Where the scripts are.
+#
+# The skills write every command as `<cue>/<script>`, and this line is the only
+# place that token is given a value. It has to come from here because there is
+# nowhere else it could come from: the skills used to spell
+# ${CLAUDE_PLUGIN_ROOT%/}/scripts/… and that variable is set for hook commands
+# only, not for the shell the Bash tool runs. So the first command of every
+# session expanded to `/scripts/status` and died with
+# `No such file or directory` — while using-cue insisted it be run exactly as
+# written. Sixty lines across ten skills said the same unrunnable thing.
+#
+# PLUGIN_ROOT is computed from $0 rather than read from the environment (see the
+# top of this file), so this works on any harness that runs the hook at all —
+# which is the same reason the language directive above can be relied on.
+scripts_dir="${SCRIPTS_DIR}"
+scripts_directive="\n\n**cue-dev's scripts are at \`${scripts_dir}\`.** Wherever a skill writes \`<cue>/<script>\`, that directory is what \`<cue>\` means: run \`${scripts_dir}/<script>\`. Substitute it verbatim — it is absolute and POSIX already, and a path reassembled by hand fails as \`command not found\` because backslashes are escapes in the shell."
+
+session_context="<EXTREMELY_IMPORTANT>\nYou have cue-dev.\n\n**Below is the full content of your 'cue-dev:using-cue' skill - your introduction to using skills. For all other skills, use the 'Skill' tool:**\n\n${using_cue_escaped}${scripts_directive}${language_directive}\n</EXTREMELY_IMPORTANT>"
+
+# Output context injection as JSON.
+# Cursor hooks expect additional_context (snake_case).
+# Claude Code hooks expect hookSpecificOutput.additionalContext (nested).
+# Copilot CLI (v1.0.11+) and others expect additionalContext (top-level, SDK standard).
+# Claude Code reads BOTH additional_context and hookSpecificOutput without
+# deduplication, so we must emit only the field the current platform consumes.
+#
+# Uses printf instead of heredoc: a heredoc this large hangs under bash 5.3 when
+# the hook's stdout is a pipe, which is how every harness runs it.
+if [ -n "${CURSOR_PLUGIN_ROOT:-}" ]; then
+  # Cursor sets CURSOR_PLUGIN_ROOT (may also set CLAUDE_PLUGIN_ROOT)
+  printf '{\n  "additional_context": "%s"\n}\n' "$session_context" | cat
+elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -z "${COPILOT_CLI:-}" ]; then
+  # Claude Code sets CLAUDE_PLUGIN_ROOT without COPILOT_CLI
+  printf '{\n  "hookSpecificOutput": {\n    "hookEventName": "SessionStart",\n    "additionalContext": "%s"\n  }\n}\n' "$session_context" | cat
+else
+  # Copilot CLI (sets COPILOT_CLI=1) or unknown platform — SDK standard format
+  printf '{\n  "additionalContext": "%s"\n}\n' "$session_context" | cat
+fi
+
+exit 0

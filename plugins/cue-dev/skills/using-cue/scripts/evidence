@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# What this item claims was checked, and what its design said would decide it.
+#
+# Why this is a script and not two sentences in /cue-dev:finish.
+#
+# In a repository of four static HTML files there was no test runner, so finish's
+# Step 1 had nothing to run. The report that went out read: *"tested manually in
+# the browser during implementation: page5.html renders correctly, the Instagram
+# button opens the link in a new tab, the back button returns to index.html."* No
+# browser was opened at any point in that session, in any stage. `outcome.md` said
+# `evidence: manual`, `scripts/verify` passed it, and a value in a field became
+# four sentences of eyewitness testimony.
+#
+# Step 1b was then written to catch exactly that, in bold, with the sentences
+# above quoted underneath. The next run said *"there is no test suite, so I follow
+# Step 1b"* — and went straight to Step 2. It never read the evidence field it was
+# told to relay and never asked the user to run the check it was told to hand
+# over. Naming a procedure is cheaper than performing one and reads the same in a
+# transcript.
+#
+# So the two facts arrive as output rather than as instructions to go and look:
+#
+#   what was claimed   outcome.md's `checked-by` and `evidence`, verbatim
+#   what would decide  design.md's "How we know it works", verbatim
+#
+# Neither is a judgment and neither can be produced from memory. What is left for
+# the skill is the one question a script cannot ask — whether a tool call in this
+# session produced the observation — and the user, who is the only party here with
+# a browser.
+#
+# It reads both records through cue_item_record, so it answers from the main
+# checkout for an item whose records are still only on its own branch. That is
+# where finish runs.
+#
+# Usage: scripts/evidence <KEY>
+#   exit 0  printed
+#   exit 1  no record for this KEY
+#   exit 2  usage error
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=plugins/cue-dev/skills/using-cue/scripts/common
+. "$SCRIPT_DIR/common"
+
+[ $# -eq 1 ] && [ -n "$1" ] || { echo "usage: scripts/evidence <KEY>" >&2; exit 2; }
+key=$1
+cue_key_is_safe "$key" || { echo "not usable as a KEY: $key" >&2; exit 2; }
+
+outcome=$(_cue_item_record "$key" outcome.md 2>/dev/null || true)
+design=$(_cue_item_record "$key" design.md 2>/dev/null || true)
+
+if [ -z "$outcome" ] && [ -z "$design" ]; then
+  printf '  %-10s%s\n' blocked "no records for $key in this repository"
+  printf '  %-10s%s\n' now "check the KEY, or the branch this item was built on"
+  exit 1
+fi
+
+checked=$(printf '%s\n' "$outcome" | sed -n 's/^checked-by:[[:space:]]*\(.*\)$/\1/p' | head -1)
+ev=$(printf '%s\n' "$outcome" | sed -n 's/^evidence:[[:space:]]*\(.*\)$/\1/p' | head -1)
+
+printf '  %-10s%s\n' claimed "checked-by: ${checked:-(no line)} · evidence: ${ev:-(no line)}"
+
+# The design's own answer to "what decides that this is done". Printed verbatim
+# and never summarised: the summary is where "opens the link in a new tab" turned
+# into an observation somebody had supposedly made.
+section=$(printf '%s\n' "$design" \
+  | awk '/^## How we know it works/ { on = 1; next } /^## / { on = 0 } on' \
+  | sed '/^[[:space:]]*$/d')
+
+if [ -n "$section" ]; then
+  first=1
+  while IFS= read -r line; do
+    if [ "$first" -eq 1 ]; then
+      printf '  %-10s%s\n' decides "$line"
+      first=0
+    else
+      printf '  %-10s%s\n' '' "$line"
+    fi
+  done <<< "$section"
+else
+  printf '  %-10s%s\n' decides "the design names no check — nothing here says what done means"
+fi
+
+# --- what the dispatches left behind -----------------------------------------
+#
+# Only for items that asked for independent-review, because only there is there
+# anything on disk to count. Each dispatched task writes its implementer report
+# into the item's sdd workspace, so the number of report files is the closest
+# thing to a fact about whether the loop ran at all.
+#
+# It is said, not enforced, and the distinction is the point. A run whose whole
+# implementation happened in the controller session leaves zero reports and is
+# about to write `checked-by: independent-review` from memory of what the item
+# asked for — this is where that gets noticed. But the same zero is what a
+# `git clean -fdx` leaves behind after a perfectly good run, and the workspace is
+# git-ignored scratch either way, so a gate here would eventually be cleared by
+# writing a value that was not true. That is the one failure `checked-by` exists
+# to prevent, and it is not worth trading for.
+#
+# A real run of the full cycle dispatched nothing at all on an item whose header
+# said independent-review, and nothing in the session had a reason to say so
+# until finish.
+asked=$(cue_item_check_resolved "$key" 2>/dev/null || true)
+if [ "$asked" = independent-review ]; then
+  plan=$(_cue_item_record "$key" plan.md 2>/dev/null || true)
+  tasks=$(printf '%s\n' "$plan" | awk '/^```/ { infence = !infence; next }
+                                       !infence && /^#+[ \t]+Task[ \t]+[0-9]+/ { n++ }
+                                       END { print n + 0 }')
+  sdd="$(cue_repo_root)/.cue/dev/sdd/$key"
+  reports=$(find "$sdd" -maxdepth 1 -name 'task-*-report.md' 2>/dev/null | grep -c . || true)
+
+  printf '  %-10s%s\n' asked "independent-review — a subagent per task, and a reviewer that did not write it"
+  if [ "$reports" -eq 0 ]; then
+    printf '  %-10s%s\n' reports "none in $sdd"
+    printf '  %-10s%s\n' '' "either no task was dispatched, or the workspace has been cleaned since"
+  else
+    printf '  %-10s%s\n' reports "$reports for ${tasks} task(s) in $sdd"
+  fi
+fi
+
+# The question, in the imperative, because it is the step. Printed on every run:
+# `evidence: tests-only` with a green suite is the case where the answer is easy,
+# and a check that only fires on the hard case is a check nobody has practised.
+printf '\n'
+printf '  %-10s%s\n' ask "for each line above: which tool call in THIS session produced it?"
+printf '  %-10s%s\n' rule "no tool call, no observation — report it as unrun, or ask the user to run it"
+exit 0

@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+# Builds the task dependency graph from plan.md's Interfaces blocks and writes it
+# into the same file as a "## Task dependencies" section (mermaid). Replaces an
+# existing one (idempotent).
+#
+# It goes at the top, above the first `## ` heading, for the reason design.md
+# opens with "## Structure": the shape of the thing comes before the parts of it.
+# A reader arriving at a nine-task plan wants to know what depends on what before
+# reading task 1, and at the bottom the graph is behind every task it describes —
+# read last, if at all.
+#
+# An edge exists only when the same symbol appears in task A's Produces and task
+# B's Consumes. That is, the graph appears only if the planner wrote exact
+# signatures — paraphrase them and you silently get an empty graph.
+#
+# So this graph is an accessory. Its failure never stops the pipeline. The one
+# exception is failing to find the task headers at all, which means plan.md's
+# format is broken.
+#
+# Usage: scripts/task-graph <KEY|PLAN_FILE>
+#   exit 0  section written, or skipped for lack of evidence (with a warning)
+#   exit 1  no plan.md / no task headers found
+#   exit 2  usage error
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=plugins/cue-dev/skills/using-cue/scripts/common
+. "$SCRIPT_DIR/common"
+
+if [ $# -ne 1 ]; then
+  echo "usage: scripts/task-graph <KEY|PLAN_FILE>" >&2
+  exit 2
+fi
+
+arg=$1
+if [ -f "$arg" ]; then
+  plan=$arg
+else
+  cue_key_is_safe "$arg" || { echo "not usable as a KEY: $arg" >&2; exit 2; }
+  plan="$(cue_work_dir "$arg")/plan.md"
+fi
+[ -f "$plan" ] || { echo "no plan.md: $plan" >&2; exit 1; }
+
+SECTION_HEADING='## Task dependencies'
+
+# Byte semantics, chosen rather than fallen into.
+#
+# This used to ask for a UTF-8 locale so that awk would count characters. Three
+# rounds of CI went into that request: `C.UTF-8` does not exist on macOS, the
+# names in `locale -a` there are not all names setlocale accepts, `locale charmap`
+# answers from the name it is handed, and when a working name was finally asked
+# for, macOS's awk counted bytes anyway. It has no multi-byte mode to reach.
+#
+# So the program does its own UTF-8 arithmetic over bytes (u8len/u8cut above), and
+# what it needs from the locale is only that every platform agree. `C` always
+# resolves, which the name it replaces did not — an unresolved locale is what made
+# awk abort mid-file rather than merely count differently.
+export LC_ALL=C
+
+# The 64 UTF-8 continuation bytes, 0x80-0xBF, for u8len and u8cut. Octal, because
+# bash 3.2's printf does not process `\x`.
+CONT=$(printf '\200\201\202\203\204\205\206\207\210\211\212\213\214\215\216\217')
+CONT=$CONT$(printf '\220\221\222\223\224\225\226\227\230\231\232\233\234\235\236\237')
+CONT=$CONT$(printf '\240\241\242\243\244\245\246\247\250\251\252\253\254\255\256\257')
+CONT=$CONT$(printf '\260\261\262\263\264\265\266\267\270\271\272\273\274\275\276\277')
+
+graph=$(awk -v heading="$SECTION_HEADING" -v CONT="$CONT" '
+  function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+
+  # UTF-8 arithmetic done by hand, on bytes.
+  #
+  # awk is asked to count and cut *characters* for the label limit below, and on
+  # macOS it cannot: its awk counts bytes whatever the locale says, and all four
+  # candidate UTF-8 locales answered 3 for one character. Cutting by bytes then
+  # split a Korean label mid-character, and the invalid sequence that produced was
+  # rejected by the next tool to read the file — `sed: RE error: illegal byte
+  # sequence`, from a suite that had nothing to do with locales.
+  #
+  # In UTF-8 every byte from 0x80 to 0xBF continues a character and every other
+  # byte starts one, which is all this needs to know. CONT carries those 64 bytes,
+  # built by the shell below. cue_display_width counts the same way.
+  function u8len(s,   i, n) {
+    n = 0
+    for (i = 1; i <= length(s); i++)
+      if (index(CONT, substr(s, i, 1)) == 0) n++
+    return n
+  }
+
+  function u8cut(s, max,   i, n, c, out) {
+    n = 0
+    out = ""
+    for (i = 1; i <= length(s); i++) {
+      c = substr(s, i, 1)
+      if (index(CONT, c) == 0) {
+        if (n >= max) return out
+        n++
+      }
+      out = out c
+    }
+    return out
+  }
+
+  # "SessionStore.setTTL(id: string): Promise<void>" -> "SessionStore.setTTL"
+  function normalize(s,   p) {
+    s = trim(s)
+    gsub(/`/, "", s)
+    gsub(/^[\[]|[\]]$/, "", s)
+    p = index(s, "(")
+    if (p > 0) s = substr(s, 1, p - 1)
+    sub(/:.*$/, "", s)          # strip the type annotation (when there are no parens)
+    return trim(s)
+  }
+
+  # `answered` counts fields that were filled in at all; `syms` holds only the
+  # ones naming something. The two differ on exactly one word.
+  #
+  # `none` is what scripts/skeleton tells a planner to write for a task that
+  # neither consumes nor produces, and it was being matched as a symbol like any
+  # other — so every pair of tasks whose Produces and Consumes both said `none`
+  # got an edge, in both directions. Two such tasks in a plan is the ordinary
+  # case, and the result was `warning: the task dependencies contain a cycle` over
+  # a plan with no dependencies at all, plus a graph wiring every independent task
+  # to every other. It reproduces on a two-task fixture straight out of the
+  # skeleton.
+  #
+  # Not the same as an empty field: a plan that answered `none` has been thought
+  # about and gets its node-only graph, while one with no Interfaces blocks gets
+  # the warning that says to fill them in.
+  function record(kind, n, text,   parts, i, sym) {
+    if (index(text, "(") > 0) {
+      # indistinguishable from commas inside the parens, so treat it as one unit
+      sym = normalize(text)
+      if (sym == "") return
+      answered++
+      if (tolower(sym) != "none") syms[kind, n, ++cnt[kind, n]] = sym
+      return
+    }
+    split(text, parts, ",")
+    for (i in parts) {
+      sym = normalize(parts[i])
+      if (sym == "") continue
+      answered++
+      if (tolower(sym) != "none") syms[kind, n, ++cnt[kind, n]] = sym
+    }
+  }
+
+  /^```/ { fence = !fence; next }
+  fence { next }
+
+  /^#+[ \t]+Task[ \t]+[0-9]+/ {
+    match($0, /Task[ \t]+[0-9]+/)
+    cur = substr($0, RSTART + 4, RLENGTH - 4) + 0
+    order[++ntask] = cur
+    name = $0
+    sub(/^#+[ \t]+Task[ \t]+[0-9]+[ \t]*:?[ \t]*/, "", name)
+    sub(/[ \t]*\[|\][ \t]*$/, "", name)
+    tname[cur] = trim(name)
+    mode = ""
+    next
+  }
+
+  cur == "" { next }
+
+  /^[ \t]*\*\*Interfaces:\*\*/ { mode = "iface"; kind = ""; next }
+  /^[ \t]*-[ \t]*\[[ x]\]/ { mode = ""; next }
+  /^[ \t]*\*\*/ { if ($0 !~ /Interfaces/) mode = "" }
+
+  mode == "iface" {
+    if ($0 ~ /^[ \t]*-?[ \t]*Produces[ \t]*:/) {
+      kind = "P"; line = $0; sub(/^[ \t]*-?[ \t]*Produces[ \t]*:/, "", line)
+      record(kind, cur, line); next
+    }
+    if ($0 ~ /^[ \t]*-?[ \t]*Consumes[ \t]*:/) {
+      kind = "C"; line = $0; sub(/^[ \t]*-?[ \t]*Consumes[ \t]*:/, "", line)
+      record(kind, cur, line); next
+    }
+    if (kind != "" && $0 ~ /^[ \t]+[^ \t]/) { record(kind, cur, $0) }
+  }
+
+  END {
+    if (ntask == 0) { print "ERR:no-tasks"; exit }
+
+    if (answered == 0) { print "ERR:no-interfaces"; exit }
+
+    # edges: A.Produces ∩ B.Consumes
+    for (i = 1; i <= ntask; i++) {
+      a = order[i]
+      for (p = 1; p <= cnt["P", a]; p++) {
+        for (j = 1; j <= ntask; j++) {
+          b = order[j]
+          if (a == b) continue
+          for (c = 1; c <= cnt["C", b]; c++) {
+            if (syms["P", a, p] == syms["C", b, c]) {
+              key = a "->" b
+              if (!(key in seen)) { seen[key] = 1; edge[++nedge] = key
+                                    indeg[b]++; outn[a] = outn[a] }
+            }
+          }
+        }
+      }
+    }
+
+    # cycle detection (Kahn)
+    for (i = 1; i <= ntask; i++) { n = order[i]; deg[n] = indeg[n] + 0 }
+    removed = 0
+    changed = 1
+    while (changed) {
+      changed = 0
+      for (i = 1; i <= ntask; i++) {
+        n = order[i]
+        if (done[n] || deg[n] != 0) continue
+        done[n] = 1; removed++; changed = 1
+        for (e = 1; e <= nedge; e++) {
+          split(edge[e], ab, "->")
+          if (ab[1] + 0 == n) deg[ab[2] + 0]--
+        }
+      }
+    }
+    if (removed < ntask) print "WARN:cycle"
+    if (ntask > 15) print "WARN:size:" ntask
+
+    print "GRAPH"
+    print heading
+    print ""
+    # Which way the arrows point, said once, in the document. An edge is drawn
+    # A→B when B consumes what A produces, so it runs with the work rather than
+    # with the dependency — and read as "A depends on B" it inverts the whole
+    # plan. A reader asked exactly that, about a graph they had just had built.
+    # It is one line and it is not derivable from the picture.
+    print "> `A → B`: B consumes what A produces — do A first."
+    print ""
+    print "```mermaid"
+    print "graph LR"
+    for (i = 1; i <= ntask; i++) {
+      n = order[i]
+      label = tname[n]
+      if (u8len(label) > 30) label = u8cut(label, 29) "…"
+      gsub(/"/, "#quot;", label)
+      printf "    T%d[\"%d. %s\"]\n", n, n, label
+    }
+    for (e = 1; e <= nedge; e++) {
+      split(edge[e], ab, "->")
+      printf "    T%d --> T%d\n", ab[1], ab[2]
+    }
+    print "```"
+  }
+' "$plan")
+
+case "$graph" in
+  ERR:no-tasks*)
+    echo "no tasks found in plan.md (expected '### Task N: name')" >&2
+    exit 1
+    ;;
+  ERR:no-interfaces*)
+    echo "warning: Interfaces blocks are empty, so no dependency graph was built." >&2
+    echo "         Fill each task's Produces/Consumes with exact signatures." >&2
+    exit 0
+    ;;
+esac
+
+while [ "${graph%%$'\n'*}" != "GRAPH" ]; do
+  first=${graph%%$'\n'*}
+  case "$first" in
+    WARN:cycle) echo "warning: the task dependencies contain a cycle. Check the task order." >&2 ;;
+    WARN:size:*) echo "warning: ${first#WARN:size:} tasks. The graph may be hard to read." >&2 ;;
+  esac
+  graph=${graph#*$'\n'}
+done
+graph=${graph#*$'\n'}
+
+# Remove the existing section, then insert the new one (idempotent).
+tmp=$(mktemp)
+awk -v heading="$SECTION_HEADING" '
+  $0 == heading { skip = 1; next }
+  skip && /^## / { skip = 0 }
+  !skip { print }
+' "$plan" > "$tmp"
+
+# tidy up trailing blank lines
+awk 'BEGIN{n=0} {lines[++n]=$0} END{while(n>0 && lines[n]=="") n--; for(i=1;i<=n;i++) print lines[i]}' "$tmp" > "$tmp.2"
+
+# The anchor is the first `## ` heading — `## Global Constraints` in the frame
+# scripts/skeleton writes. That puts the graph under the plan's Goal/Architecture
+# preamble and above everything else, which is the position design.md gives
+# "## Structure".
+#
+# The fence toggle is not decoration. A plan step that pastes a markdown sample
+# containing `## something` is ordinary, and anchoring on it would drop the graph
+# into the middle of a code block.
+#
+# A plan with no `## ` heading at all fails verify (`no '## Global Constraints'
+# section`), so the END branch is for a file being repaired rather than a normal
+# one — appending is the answer that loses nothing.
+#
+# The graph travels through the environment rather than -v: it contains
+# backslashes and its own ``` fence, and awk's -v applies escape processing to
+# what it is given.
+GRAPH="$graph" awk '
+  /^```/ { fence = !fence }
+  !fence && !placed && /^## / {
+    if (prev != "") print ""
+    print ENVIRON["GRAPH"]
+    print ""
+    placed = 1
+  }
+  { print; prev = $0 }
+  END { if (!placed) { print ""; print ENVIRON["GRAPH"] } }
+' "$tmp.2" > "$plan"
+rm -f "$tmp" "$tmp.2"
+
+echo "wrote the dependency graph to $plan"

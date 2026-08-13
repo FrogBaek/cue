@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# Creates the outcome.md skeleton with one unrecorded row per task in plan.md.
+#
+# This skeleton replaces both the gate and the renderer. If the controller skips
+# task 4, "4 · unrecorded" stays in the file and shows up in the PR diff. No
+# omission-detection logic, no state machine, no renderer — the gap displays itself.
+#
+# Task parsing uses the same rules as task-brief (ignore inside code fences,
+# `#+ Task N`). If the two drift, the outcome row numbers stop matching the task
+# numbers actually dispatched.
+#
+# Usage: scripts/outcome-init <KEY> [--force]
+#   exit 0  created (prints the path)
+#   exit 1  no plan.md / zero tasks / outcome.md already exists
+#   exit 2  usage error
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=plugins/cue-dev/skills/using-cue/scripts/common
+. "$SCRIPT_DIR/common"
+
+force=0
+args=()
+for a in "$@"; do
+  case "$a" in
+    --force) force=1 ;;
+    *) args+=("$a") ;;
+  esac
+done
+
+if [ "${#args[@]}" -ne 1 ]; then
+  echo "usage: scripts/outcome-init <KEY> [--force]" >&2
+  exit 2
+fi
+
+key=${args[0]}
+cue_key_is_safe "$key" || { echo "not usable as a KEY: $key" >&2; exit 2; }
+
+work=$(cue_work_dir "$key")
+plan="$work/plan.md"
+out="$work/outcome.md"
+
+[ -f "$plan" ] || { echo "no plan.md: $plan" >&2; exit 1; }
+
+# Overwriting an outcome.md that already holds records destroys the implementation
+# history.
+if [ -f "$out" ] && [ "$force" -ne 1 ]; then
+  echo "outcome.md already exists: $out" >&2
+  echo "Use --force to rebuild it, or scripts/redo implement to rewind." >&2
+  exit 1
+fi
+
+count=$(awk '
+  /^```/ { infence = !infence; next }
+  !infence && /^#+[ \t]+Task[ \t]+[0-9]+/ { n++ }
+  END { print n + 0 }
+' "$plan")
+
+if [ "$count" -eq 0 ]; then
+  echo "no tasks found in plan.md (expected '### Task N: name')" >&2
+  exit 1
+fi
+
+# The status tokens and section headings are fixed to ASCII.
+#
+# outcome.md stays in git as a record read six months later, and status parses "how
+# many unrecorded rows are left". If that parsing depended on a setting that can
+# change (language), past records would become undecipherable the moment the
+# language changed, and a project with contributors in more than one language would
+# break inside a single repository. The structure is fixed; the user's language
+# lives in the prose inside it.
+{
+  echo "<!-- Replace the matching row as each task completes. Never add or remove rows. -->"
+  echo "<!-- Format: - <N> · <SHA|no-commit> · as-planned | deviated | skipped -->"
+  echo
+  echo "# $key — implementation outcome"
+  echo
+  # How strongly the work was actually checked, recorded next to the result it
+  # justifies. demand.md's `check:` holds what this item asked for; this holds what
+  # happened. Keeping them apart is what makes scripts/verify's comparison mean
+  # anything — a field that merely echoed the request would prove nothing about
+  # this work.
+  echo "checked-by: unrecorded"
+  echo "evidence:   unrecorded"
+  echo
+  echo "## Tasks"
+  for ((i = 1; i <= count; i++)); do
+    echo "- $i · unrecorded"
+  done
+  echo
+  echo "## Summary"
+  echo "(write after implementation)"
+} > "$out"
+
+printf '%s\n' "$out"
+echo "${count} tasks" >&2

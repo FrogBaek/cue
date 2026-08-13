@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# Where one work item's worktree is, and where a new one goes.
+#
+# The third fact to come out of the conversation and into the record. The first
+# two were the start point (recorded because "where was this cut from" has no
+# single answer once the branch exists) and the branch name (recorded because the
+# name the tooling makes is not always the name that was asked for). This one is
+# recorded for a third reason: nothing could observe it at all.
+#
+# cue_isolation_kind answers "am I in a worktree right now". Nobody answered
+# "where is this item's worktree", so the only copy of that path was whatever the
+# session remembered. A real session created `.cue/worktrees/<KEY>` — a location
+# named nowhere in this plugin — and finish-cleanup, matching that path against
+# the two it knows, fell through to its default and declared the worktree the
+# harness's. It called for a tool that no-ops on a `git worktree add` worktree,
+# then reported `still present` and exited 1. One invented path, five symptoms.
+#
+# So: --propose is the only place a path is chosen, --line is the only place the
+# record is written, and <KEY> is the only place it is read back.
+#
+# There is a second job, and it is the reason this is a script rather than a
+# convention. cue-dev no longer asks the harness to move the session into the
+# worktree, so the work is done with `git -C <path>` and absolute paths — and a
+# forgotten `-C` edits the main checkout instead. A path that can be asked for is
+# a path nobody has to retype.
+#
+# Usage:
+#   work-path <KEY>              the recorded worktree, absolute
+#   work-path <KEY> --show       it, as a notice line
+#   work-path --propose <KEY>    where a worktree for <KEY> goes (creates nothing)
+#   work-path --line [<path>]    the header line, for start to write
+#
+#   --line takes the current checkout when given no argument, and refuses in the
+#   main checkout: an item built in place has no worktree, and recording the main
+#   root as one would hand finish-cleanup the whole repository to remove.
+#
+#   exit 0  answered
+#   exit 1  no such work / this item has no recorded worktree / not a worktree
+#   exit 2  usage error / not a repository
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=plugins/cue-dev/skills/using-cue/scripts/common
+. "$SCRIPT_DIR/common"
+
+cue_repo_root >/dev/null || exit 2
+
+usage() {
+  # The Usage block, matched rather than numbered. A fixed range is a reference
+  # nothing checks: scripts/integration grew nine header lines and its usage()
+  # went on printing the four that used to be there, so a real session asking for
+  # a form it accepts was handed a paragraph out of a design note.
+  awk '/^# Usage:/ { on = 1 } on && !/^#/ { exit } on { sub(/^# ?/, ""); print }' "$0" >&2
+  exit 2
+}
+
+if [ "${1:-}" = "--propose" ]; then
+  shift
+  [ $# -eq 1 ] || usage
+  cue_key_is_safe "$1" || { echo "not usable as a KEY: $1" >&2; exit 2; }
+  cue_worktree_path "$1"
+  exit 0
+fi
+
+if [ "${1:-}" = "--line" ]; then
+  shift
+  [ $# -le 1 ] || usage
+  path=${1:-}
+  if [ -z "$path" ]; then
+    if [ "$(cue_isolation_kind)" != worktree ]; then
+      echo "not in a worktree — this item is being built in the main checkout" >&2
+      echo "that is a valid choice; it simply has no worktree line to record" >&2
+      exit 1
+    fi
+    path=$(cue_repo_root)
+  fi
+  # Normalized the same way finish-cleanup normalizes what it reads back. On Git
+  # Bash `git worktree list` prints `D:/repo/...` while `pwd` gives `/d/repo/...`,
+  # and a record in one form compared against an observation in the other
+  # disagrees on Windows only.
+  path=$(cd "$path" 2>/dev/null && pwd -P) || {
+    echo "no such directory: ${1:-$path}" >&2
+    exit 1
+  }
+  printf '<!-- worktree: %s -->\n' "$path"
+  exit 0
+fi
+
+[ $# -ge 1 ] && [ $# -le 2 ] || usage
+key=$1
+mode=${2:---path}
+
+cue_key_is_safe "$key" || { echo "not usable as a KEY: $key" >&2; exit 2; }
+work=$(cue_work_dir "$key")
+[ -d "$work" ] || { echo "work not found: $key (no $work)" >&2; exit 1; }
+
+no_answer() {
+  echo "no worktree recorded for $key" >&2
+  echo "expected a header line in $work/demand.md:" >&2
+  echo "  <!-- worktree: <path> -->    (work-path --line prints it)" >&2
+  echo "an item built in the main checkout has none, and that is not an error;" >&2
+  echo "cue-dev treats a missing line as 'no worktree of ours', never as 'find one'." >&2
+  exit 1
+}
+
+case "$mode" in
+  --path)
+    cue_item_worktree "$key" || no_answer
+    printf '\n'
+    ;;
+  --show)
+    path=$(cue_item_worktree "$key") || no_answer
+    printf '  %-10s%s\n' worktree "$path"
+    ;;
+  *) usage ;;
+esac

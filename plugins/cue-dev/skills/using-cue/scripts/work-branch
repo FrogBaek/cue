@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# The branch one work item was cut onto.
+#
+# cue-dev requires nothing of this name. It used to require exactly one thing —
+# that the KEY appeared somewhere in it — not as a convention anybody wanted, but
+# because the branch name was the only place the KEY was written down: status,
+# redo, backups and gate all recovered it by matching the branch name against the
+# .cue/dev/<KEY>/ directories. A team whose branches are called
+# `feat/add-hello-world-test` got a warning at the end of start, after the name had
+# already been chosen, saying its work could not be found later.
+#
+# So the name is recorded instead, in that item's demand.md header:
+#
+#   <!-- branch: feat/add-hello-world-test -->
+#
+# and the branch name goes back to being the team's business. The same argument as
+# scripts/marker and work-base --line applies to who writes that string: a line
+# other scripts parse must have exactly one author, or it drifts in the one
+# repository that formatted it differently, and the drift is silent — the file is
+# written, the commit succeeds, and only that item stops being findable.
+#
+# --line takes the name from git rather than from the caller's intention. Native
+# worktree tooling renames what it makes (`cue-dev/I18N` came back as
+# `worktree-cue-dev+I18N`), and recording what git actually reports turns that from
+# a warning into a non-event.
+#
+# Usage:
+#   work-branch <KEY>            the recorded branch name
+#   work-branch <KEY> --show     it, as a notice line
+#   work-branch --line [<branch>]        the header line, for start to write
+#   work-branch <KEY> --relink [<branch>]  repoint the record after a rename
+#
+#   exit 0  answered
+#   exit 1  no such work / this item has no recorded branch / no such branch
+#   exit 2  usage error / not a repository
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=plugins/cue-dev/skills/using-cue/scripts/common
+. "$SCRIPT_DIR/common"
+
+cue_repo_root >/dev/null || exit 2
+
+usage() {
+  # The Usage block, matched rather than numbered. A fixed range is a reference
+  # nothing checks: this one had already slipped a line and was printing the four
+  # forms without the `Usage:` heading above them, and scripts/integration's had
+  # slipped nine — far enough that a real session was handed a paragraph out of a
+  # design note in place of a form the script accepts.
+  awk '/^# Usage:/ { on = 1 } on && !/^#/ { exit } on { sub(/^# ?/, ""); print }' "$0" >&2
+  exit 2
+}
+
+# The name of a branch that exists, defaulting to the one checked out here.
+#
+# Callers assign it and check, rather than inlining `$(resolve_branch)` into
+# another command: an exit inside a command substitution only kills the subshell,
+# and the caller carries on with an empty answer — which here would record
+# `<!-- branch:  -->` and report success.
+resolve_branch() {
+  local name=${1:-}
+  if [ -z "$name" ]; then
+    name=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || name=""
+    if [ -z "$name" ] || [ "$name" = HEAD ]; then
+      echo "detached HEAD — check out the work branch before recording it" >&2
+      exit 1
+    fi
+  fi
+  git rev-parse --verify --quiet "refs/heads/$name" >/dev/null 2>&1 || {
+    echo "no such branch: '$name'" >&2
+    echo "the branch must exist before it is recorded — create it first" >&2
+    exit 1
+  }
+  printf '%s' "$name"
+}
+
+if [ "${1:-}" = "--line" ]; then
+  shift
+  [ $# -le 1 ] || usage
+  branch=$(resolve_branch "${1:-}") || exit 1
+  printf '<!-- branch: %s -->\n' "$branch"
+  exit 0
+fi
+
+[ $# -ge 1 ] && [ $# -le 3 ] || usage
+key=$1
+mode=${2:---name}
+
+cue_key_is_safe "$key" || { echo "not usable as a KEY: $key" >&2; exit 2; }
+work=$(cue_work_dir "$key")
+[ -d "$work" ] || { echo "work not found: $key (no $work)" >&2; exit 1; }
+
+no_answer() {
+  echo "no branch recorded for $key" >&2
+  echo "expected a header line in $work/demand.md:" >&2
+  echo "  <!-- branch: <name> -->    (work-branch --line prints it)" >&2
+  echo "an item started before branches were recorded is matched by name instead;" >&2
+  echo "repoint it with: work-branch $key --relink" >&2
+  exit 1
+}
+
+case "$mode" in
+  --name)
+    cue_item_branch "$key" || no_answer
+    printf '\n'
+    ;;
+  --show)
+    branch=$(cue_item_branch "$key") || no_answer
+    printf '  %-10s%s\n' branch "$branch"
+    ;;
+  --relink)
+    # The repair path for `git branch -m`, and the only sanctioned one. Editing
+    # the header by hand is how a line acquires a second author.
+    file="$work/demand.md"
+    [ -f "$file" ] || { echo "no demand.md for $key" >&2; exit 1; }
+    branch=$(resolve_branch "${3:-}") || exit 1
+    line="<!-- branch: $branch -->"
+    tmp="$file.$$"
+    # Replace the existing header line, or put one at the top when the item
+    # predates them. Only the header is considered: past the first line that is
+    # neither a comment nor blank, a `<!-- branch: -->` belongs to the quoted
+    # ticket and is none of our business.
+    awk -v line="$line" '
+      BEGIN { done = 0; header = 1 }
+      header && /^[[:space:]]*$/          { print; next }
+      header && /^<!--/ {
+        if (!done && $0 ~ /branch:/) { print line; done = 1; next }
+        print; next
+      }
+      header {
+        header = 0
+        if (!done) { print line; done = 1 }
+      }
+      { print }
+      END { if (!done) print line }
+    ' "$file" > "$tmp"
+    mv "$tmp" "$file"
+    printf '  %-10s%s\n' branch "$branch"
+    ;;
+  *) usage ;;
+esac
